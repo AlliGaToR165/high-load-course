@@ -14,7 +14,7 @@ class RateLimitInterceptorTest {
     @Test
     fun `request is passed when endpoint has available permit`() {
         val interceptor = RateLimitInterceptor(
-            EndpointRateLimitPolicy { RateLimitDecision(true, 1) }
+            EndpointRateLimitPolicy { RateLimitDecision(true, 1) },
         )
         val response = MockHttpServletResponse()
 
@@ -29,9 +29,13 @@ class RateLimitInterceptorTest {
     }
 
     @Test
-    fun `request is rejected with retry after header when limit is exceeded`() {
+    fun `pay order rate limiting is delegated to async queue`() {
+        var policyChecks = 0
         val interceptor = RateLimitInterceptor(
-            EndpointRateLimitPolicy { RateLimitDecision(false, 3) }
+            EndpointRateLimitPolicy {
+                policyChecks++
+                RateLimitDecision(false, 3)
+            },
         )
         val response = MockHttpServletResponse()
 
@@ -39,6 +43,25 @@ class RateLimitInterceptorTest {
             MockHttpServletRequest(),
             response,
             handler("payOrder"),
+        )
+
+        assertTrue(passed)
+        assertEquals(200, response.status)
+        assertEquals(0, policyChecks)
+        assertEquals(null, response.getHeader(HttpHeaders.RETRY_AFTER))
+    }
+
+    @Test
+    fun `non payment request is rejected with retry after header when limit is exceeded`() {
+        val interceptor = RateLimitInterceptor(
+            EndpointRateLimitPolicy { RateLimitDecision(false, 3) },
+        )
+        val response = MockHttpServletResponse()
+
+        val passed = interceptor.preHandle(
+            MockHttpServletRequest(),
+            response,
+            handler("createUser"),
         )
 
         assertFalse(passed)
@@ -68,7 +91,7 @@ class RateLimitInterceptorTest {
     @Test
     fun `unannotated handler is not rate limited`() {
         val interceptor = RateLimitInterceptor(
-            EndpointRateLimitPolicy { RateLimitDecision(false, 1) }
+            EndpointRateLimitPolicy { RateLimitDecision(false, 1) },
         )
 
         val passed = interceptor.preHandle(
