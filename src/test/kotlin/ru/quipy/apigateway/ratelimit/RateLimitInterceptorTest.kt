@@ -14,7 +14,8 @@ class RateLimitInterceptorTest {
     @Test
     fun `request is passed when endpoint has available permit`() {
         val interceptor = RateLimitInterceptor(
-            EndpointRateLimitPolicy { RateLimitDecision(true, 1) }
+            EndpointRateLimitPolicy { RateLimitDecision(true, 1) },
+            ConfiguredPaymentAccounts("acc-3"),
         )
         val response = MockHttpServletResponse()
 
@@ -31,7 +32,8 @@ class RateLimitInterceptorTest {
     @Test
     fun `request is rejected with retry after header when limit is exceeded`() {
         val interceptor = RateLimitInterceptor(
-            EndpointRateLimitPolicy { RateLimitDecision(false, 3) }
+            EndpointRateLimitPolicy { RateLimitDecision(false, 3) },
+            ConfiguredPaymentAccounts("acc-3"),
         )
         val response = MockHttpServletResponse()
 
@@ -47,20 +49,50 @@ class RateLimitInterceptorTest {
     }
 
     @Test
-    fun `different endpoints use independent rate limiters`() {
-        val createUserLimiter = TestRateLimiter(listOf(true, false))
-        val payOrderLimiter = TestRateLimiter(listOf(true, true))
+    fun `request is checked against every configured payment account`() {
+        val checkedKeys = mutableListOf<RateLimitKey>()
+        val interceptor = RateLimitInterceptor(
+            EndpointRateLimitPolicy { key ->
+                checkedKeys.add(key)
+                RateLimitDecision(key.accountName == "acc-3", 2)
+            },
+            ConfiguredPaymentAccounts("acc-3, acc-4"),
+        )
+
+        val passed = interceptor.preHandle(
+            MockHttpServletRequest(),
+            MockHttpServletResponse(),
+            handler("createUser"),
+        )
+
+        assertFalse(passed)
+        assertEquals(
+            listOf(
+                RateLimitKey("acc-3", ApiEndpoint.CREATE_USER),
+                RateLimitKey("acc-4", ApiEndpoint.CREATE_USER),
+            ),
+            checkedKeys,
+        )
+    }
+
+    @Test
+    fun `different account and endpoint keys use independent rate limiters`() {
         val registry = EndpointRateLimiterRegistry(
             mapOf(
-                ApiEndpoint.CREATE_USER to ConfiguredEndpointRateLimiter(createUserLimiter, 1),
-                ApiEndpoint.PAY_ORDER to ConfiguredEndpointRateLimiter(payOrderLimiter, 2),
+                ApiEndpoint.CREATE_USER to {
+                    ConfiguredEndpointRateLimiter(TestRateLimiter(listOf(true, false)), 1)
+                },
+                ApiEndpoint.PAY_ORDER to {
+                    ConfiguredEndpointRateLimiter(TestRateLimiter(listOf(true, true)), 2)
+                },
             )
         )
 
-        assertTrue(registry.check(ApiEndpoint.CREATE_USER).allowed)
-        assertFalse(registry.check(ApiEndpoint.CREATE_USER).allowed)
-        assertTrue(registry.check(ApiEndpoint.PAY_ORDER).allowed)
-        val payOrderDecision = registry.check(ApiEndpoint.PAY_ORDER)
+        assertTrue(registry.check(RateLimitKey("acc-3", ApiEndpoint.CREATE_USER)).allowed)
+        assertFalse(registry.check(RateLimitKey("acc-3", ApiEndpoint.CREATE_USER)).allowed)
+        assertTrue(registry.check(RateLimitKey("acc-4", ApiEndpoint.CREATE_USER)).allowed)
+        assertTrue(registry.check(RateLimitKey("acc-3", ApiEndpoint.PAY_ORDER)).allowed)
+        val payOrderDecision = registry.check(RateLimitKey("acc-3", ApiEndpoint.PAY_ORDER))
         assertTrue(payOrderDecision.allowed)
         assertEquals(2, payOrderDecision.retryAfterSeconds)
     }
@@ -68,7 +100,8 @@ class RateLimitInterceptorTest {
     @Test
     fun `unannotated handler is not rate limited`() {
         val interceptor = RateLimitInterceptor(
-            EndpointRateLimitPolicy { RateLimitDecision(false, 1) }
+            EndpointRateLimitPolicy { RateLimitDecision(false, 1) },
+            ConfiguredPaymentAccounts("acc-3"),
         )
 
         val passed = interceptor.preHandle(
