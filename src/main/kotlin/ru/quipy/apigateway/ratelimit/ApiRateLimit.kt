@@ -5,6 +5,7 @@ import jakarta.servlet.http.HttpServletRequest
 import jakarta.servlet.http.HttpServletResponse
 import org.springframework.boot.context.properties.ConfigurationProperties
 import org.springframework.boot.context.properties.EnableConfigurationProperties
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import org.springframework.http.HttpHeaders
@@ -21,6 +22,7 @@ import ru.quipy.common.utils.RateLimiter
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import java.time.Duration
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -60,13 +62,32 @@ data class RateLimitDecision(
     val retryAfterSeconds: Long,
 )
 
+data class RateLimitKey(
+    val accountName: String,
+    val endpoint: ApiEndpoint,
+)
+
 data class ConfiguredEndpointRateLimiter(
     val rateLimiter: RateLimiter,
     val retryAfterSeconds: Long,
 )
 
 fun interface EndpointRateLimitPolicy {
-    fun check(endpoint: ApiEndpoint): RateLimitDecision
+    fun check(key: RateLimitKey): RateLimitDecision
+}
+
+@Component
+class ConfiguredPaymentAccounts(
+    @Value("\${payment.accounts}") accountNames: String,
+) {
+    val names = accountNames.split(',')
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+        .distinct()
+
+    init {
+        require(names.isNotEmpty()) { "At least one payment account must be configured" }
+    }
 }
 
 interface PayOrderRequestQueue {
@@ -76,6 +97,7 @@ interface PayOrderRequestQueue {
 @Component
 class AsyncPayOrderRequestQueue(
     private val rateLimitPolicy: EndpointRateLimitPolicy,
+    private val paymentAccounts: ConfiguredPaymentAccounts,
     properties: ApiRateLimitProperties,
 ) : PayOrderRequestQueue, AutoCloseable {
     private val settings = properties.payOrder
@@ -139,7 +161,11 @@ class AsyncPayOrderRequestQueue(
                 return
             }
 
-            if (rateLimitPolicy.check(ApiEndpoint.PAY_ORDER).allowed) {
+            val allAccountsAllowed = paymentAccounts.names
+                .asSequence()
+                .map { accountName -> rateLimitPolicy.check(RateLimitKey(accountName, ApiEndpoint.PAY_ORDER)) }
+                .all(RateLimitDecision::allowed)
+            if (allAccountsAllowed) {
                 request.execute()
                 return
             }
@@ -187,10 +213,14 @@ class AsyncPayOrderRequestQueue(
 }
 
 class EndpointRateLimiterRegistry(
-    private val limiters: Map<ApiEndpoint, ConfiguredEndpointRateLimiter>,
+    private val limiterFactories: Map<ApiEndpoint, () -> ConfiguredEndpointRateLimiter>,
 ) : EndpointRateLimitPolicy {
-    override fun check(endpoint: ApiEndpoint): RateLimitDecision {
-        val limiter = limiters.getValue(endpoint)
+    private val limiters = ConcurrentHashMap<RateLimitKey, ConfiguredEndpointRateLimiter>()
+
+    override fun check(key: RateLimitKey): RateLimitDecision {
+        val limiter = limiters.computeIfAbsent(key) {
+            limiterFactories.getValue(key.endpoint).invoke()
+        }
         return RateLimitDecision(
             limiter.rateLimiter.tick(),
             limiter.retryAfterSeconds,
@@ -201,6 +231,7 @@ class EndpointRateLimiterRegistry(
 @Component
 class RateLimitInterceptor(
     private val rateLimitPolicy: EndpointRateLimitPolicy,
+    private val paymentAccounts: ConfiguredPaymentAccounts,
 ) : HandlerInterceptor {
     override fun preHandle(
         request: HttpServletRequest,
@@ -214,11 +245,14 @@ class RateLimitInterceptor(
 
         if (endpoint == ApiEndpoint.PAY_ORDER) return true
 
-        val decision = rateLimitPolicy.check(endpoint)
-        if (decision.allowed) return true
+        val rejection = paymentAccounts.names
+            .asSequence()
+            .map { accountName -> rateLimitPolicy.check(RateLimitKey(accountName, endpoint)) }
+            .firstOrNull { !it.allowed }
+            ?: return true
 
         response.status = HttpStatus.TOO_MANY_REQUESTS.value()
-        response.setHeader(HttpHeaders.RETRY_AFTER, decision.retryAfterSeconds.toString())
+        response.setHeader(HttpHeaders.RETRY_AFTER, rejection.retryAfterSeconds.toString())
         return false
     }
 }
@@ -230,25 +264,31 @@ class ApiRateLimitConfiguration {
     fun endpointRateLimitPolicy(properties: ApiRateLimitProperties): EndpointRateLimitPolicy {
         return EndpointRateLimiterRegistry(
             mapOf(
-                ApiEndpoint.AUTHENTICATION to properties.authentication.toRateLimiter(),
-                ApiEndpoint.AUTHENTICATION_REFRESH to properties.authenticationRefresh.toRateLimiter(),
-                ApiEndpoint.CREATE_USER to properties.createUser.toRateLimiter(),
-                ApiEndpoint.CREATE_ORDER to properties.createOrder.toRateLimiter(),
-                ApiEndpoint.PAY_ORDER to properties.payOrder.toRateLimiter(),
+                ApiEndpoint.AUTHENTICATION to properties.authentication.toRateLimiterFactory(),
+                ApiEndpoint.AUTHENTICATION_REFRESH to properties.authenticationRefresh.toRateLimiterFactory(),
+                ApiEndpoint.CREATE_USER to properties.createUser.toRateLimiterFactory(),
+                ApiEndpoint.CREATE_ORDER to properties.createOrder.toRateLimiterFactory(),
+                ApiEndpoint.PAY_ORDER to properties.payOrder.toRateLimiterFactory(),
             )
         )
     }
 
-    private fun EndpointRateLimitProperties.toRateLimiter(): ConfiguredEndpointRateLimiter {
+    private fun EndpointRateLimitProperties.toRateLimiterFactory(): () -> ConfiguredEndpointRateLimiter {
         require(rate > 0) { "Rate limit must be positive" }
         require(!window.isZero && !window.isNegative) { "Rate limit window must be positive" }
         require(retryAfter.seconds > 0 && retryAfter.nano == 0) {
             "Retry-After must be a positive whole number of seconds"
         }
-        return ConfiguredEndpointRateLimiter(
-            SlidingWindowRateLimiter(rate, window),
-            retryAfter.seconds,
-        )
+
+        val configuredRate = rate
+        val configuredWindow = window
+        val configuredRetryAfterSeconds = retryAfter.seconds
+        return {
+            ConfiguredEndpointRateLimiter(
+                SlidingWindowRateLimiter(configuredRate, configuredWindow),
+                configuredRetryAfterSeconds,
+            )
+        }
     }
 }
 

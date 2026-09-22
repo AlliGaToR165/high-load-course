@@ -53,8 +53,40 @@ class AsyncPayOrderRequestQueueTest {
         }
     }
 
+    @Test
+    fun `queued pay order gets permit for every payment account`() {
+        val checkedKeys = mutableListOf<RateLimitKey>()
+        val queue = queue(
+            accountNames = "acc-3,acc-4",
+            policy = EndpointRateLimitPolicy { key ->
+                checkedKeys.add(key)
+                RateLimitDecision(true, 1)
+            },
+        )
+        val executed = CountDownLatch(1)
+
+        try {
+            queue.submit {
+                executed.countDown()
+                "accepted"
+            }
+
+            assertTrue(executed.await(1, TimeUnit.SECONDS))
+            assertEquals(
+                listOf(
+                    RateLimitKey("acc-3", ApiEndpoint.PAY_ORDER),
+                    RateLimitKey("acc-4", ApiEndpoint.PAY_ORDER),
+                ),
+                checkedKeys,
+            )
+        } finally {
+            queue.close()
+        }
+    }
+
     private fun queue(
         maxWait: Duration = Duration.ofSeconds(1),
+        accountNames: String = "acc-3",
         policy: EndpointRateLimitPolicy,
     ): AsyncPayOrderRequestQueue {
         val properties = ApiRateLimitProperties().apply {
@@ -63,7 +95,11 @@ class AsyncPayOrderRequestQueueTest {
             payOrder.queuePollInterval = Duration.ofMillis(1)
             payOrder.retryAfter = Duration.ofSeconds(3)
         }
-        return AsyncPayOrderRequestQueue(policy, properties)
+        return AsyncPayOrderRequestQueue(
+            policy,
+            ConfiguredPaymentAccounts(accountNames),
+            properties,
+        )
     }
 
     private fun waitForResult(hasResult: () -> Boolean): Boolean {
