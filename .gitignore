@@ -30,8 +30,8 @@ target/
 build/
 !**/src/main/**/build/
 !**/src/test/**/build/
-./grafana/*
-./prometheus/*
+/grafana/data/
+/prometheus/data/
 
 ### VS Code ###
 .vscode/
