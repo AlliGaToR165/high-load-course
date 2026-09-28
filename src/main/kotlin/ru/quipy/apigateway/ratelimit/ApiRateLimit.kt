@@ -1,0 +1,167 @@
+package ru.quipy.apigateway.ratelimit
+
+import jakarta.servlet.http.HttpServletRequest
+import jakarta.servlet.http.HttpServletResponse
+import org.springframework.boot.context.properties.ConfigurationProperties
+import org.springframework.boot.context.properties.EnableConfigurationProperties
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.beans.factory.annotation.Value
+import org.springframework.http.HttpHeaders
+import org.springframework.http.HttpStatus
+import org.springframework.stereotype.Component
+import org.springframework.web.method.HandlerMethod
+import org.springframework.web.servlet.HandlerInterceptor
+import org.springframework.web.servlet.config.annotation.InterceptorRegistry
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer
+import ru.quipy.common.utils.RateLimiter
+import ru.quipy.common.utils.SlidingWindowRateLimiter
+import java.time.Duration
+import java.util.concurrent.ConcurrentHashMap
+
+enum class ApiEndpoint {
+    AUTHENTICATION,
+    AUTHENTICATION_REFRESH,
+    CREATE_USER,
+    CREATE_ORDER,
+    PAY_ORDER,
+}
+
+@Target(AnnotationTarget.FUNCTION)
+@Retention(AnnotationRetention.RUNTIME)
+annotation class RateLimited(val endpoint: ApiEndpoint)
+
+class EndpointRateLimitProperties {
+    var rate: Long = 100
+    var window: Duration = Duration.ofSeconds(1)
+    var retryAfter: Duration = Duration.ofSeconds(1)
+}
+
+@ConfigurationProperties(prefix = "api.rate-limit")
+class ApiRateLimitProperties {
+    var authentication = EndpointRateLimitProperties()
+    var authenticationRefresh = EndpointRateLimitProperties()
+    var createUser = EndpointRateLimitProperties()
+    var createOrder = EndpointRateLimitProperties()
+    var payOrder = EndpointRateLimitProperties()
+}
+
+data class RateLimitDecision(
+    val allowed: Boolean,
+    val retryAfterSeconds: Long,
+)
+
+data class RateLimitKey(
+    val accountName: String,
+    val endpoint: ApiEndpoint,
+)
+
+data class ConfiguredEndpointRateLimiter(
+    val rateLimiter: RateLimiter,
+    val retryAfterSeconds: Long,
+)
+
+fun interface EndpointRateLimitPolicy {
+    fun check(key: RateLimitKey): RateLimitDecision
+}
+
+@Component
+class ConfiguredPaymentAccounts(
+    @Value("\${payment.accounts}") accountNames: String,
+) {
+    val names = accountNames.split(',')
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+        .distinct()
+
+    init {
+        require(names.isNotEmpty()) { "At least one payment account must be configured" }
+    }
+}
+
+class EndpointRateLimiterRegistry(
+    private val limiterFactories: Map<ApiEndpoint, () -> ConfiguredEndpointRateLimiter>,
+) : EndpointRateLimitPolicy {
+    private val limiters = ConcurrentHashMap<RateLimitKey, ConfiguredEndpointRateLimiter>()
+
+    override fun check(key: RateLimitKey): RateLimitDecision {
+        val limiter = limiters.computeIfAbsent(key) {
+            limiterFactories.getValue(key.endpoint).invoke()
+        }
+        return RateLimitDecision(
+            limiter.rateLimiter.tick(),
+            limiter.retryAfterSeconds,
+        )
+    }
+}
+
+@Component
+class RateLimitInterceptor(
+    private val rateLimitPolicy: EndpointRateLimitPolicy,
+    private val paymentAccounts: ConfiguredPaymentAccounts,
+) : HandlerInterceptor {
+    override fun preHandle(
+        request: HttpServletRequest,
+        response: HttpServletResponse,
+        handler: Any,
+    ): Boolean {
+        val endpoint = (handler as? HandlerMethod)
+            ?.getMethodAnnotation(RateLimited::class.java)
+            ?.endpoint
+            ?: return true
+
+        val rejection = paymentAccounts.names
+            .asSequence()
+            .map { accountName -> rateLimitPolicy.check(RateLimitKey(accountName, endpoint)) }
+            .firstOrNull { !it.allowed }
+            ?: return true
+
+        response.status = HttpStatus.TOO_MANY_REQUESTS.value()
+        response.setHeader(HttpHeaders.RETRY_AFTER, rejection.retryAfterSeconds.toString())
+        return false
+    }
+}
+
+@Configuration
+@EnableConfigurationProperties(ApiRateLimitProperties::class)
+class ApiRateLimitConfiguration {
+    @Bean
+    fun endpointRateLimitPolicy(properties: ApiRateLimitProperties): EndpointRateLimitPolicy {
+        return EndpointRateLimiterRegistry(
+            mapOf(
+                ApiEndpoint.AUTHENTICATION to properties.authentication.toRateLimiterFactory(),
+                ApiEndpoint.AUTHENTICATION_REFRESH to properties.authenticationRefresh.toRateLimiterFactory(),
+                ApiEndpoint.CREATE_USER to properties.createUser.toRateLimiterFactory(),
+                ApiEndpoint.CREATE_ORDER to properties.createOrder.toRateLimiterFactory(),
+                ApiEndpoint.PAY_ORDER to properties.payOrder.toRateLimiterFactory(),
+            )
+        )
+    }
+
+    private fun EndpointRateLimitProperties.toRateLimiterFactory(): () -> ConfiguredEndpointRateLimiter {
+        require(rate > 0) { "Rate limit must be positive" }
+        require(!window.isZero && !window.isNegative) { "Rate limit window must be positive" }
+        require(retryAfter.seconds > 0 && retryAfter.nano == 0) {
+            "Retry-After must be a positive whole number of seconds"
+        }
+
+        val configuredRate = rate
+        val configuredWindow = window
+        val configuredRetryAfterSeconds = retryAfter.seconds
+        return {
+            ConfiguredEndpointRateLimiter(
+                SlidingWindowRateLimiter(configuredRate, configuredWindow),
+                configuredRetryAfterSeconds,
+            )
+        }
+    }
+}
+
+@Configuration
+class RateLimitWebConfiguration(
+    private val rateLimitInterceptor: RateLimitInterceptor,
+) : WebMvcConfigurer {
+    override fun addInterceptors(registry: InterceptorRegistry) {
+        registry.addInterceptor(rateLimitInterceptor)
+    }
+}

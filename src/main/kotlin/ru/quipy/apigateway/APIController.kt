@@ -4,6 +4,8 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.web.bind.annotation.*
+import ru.quipy.apigateway.ratelimit.ApiEndpoint
+import ru.quipy.apigateway.ratelimit.RateLimited
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
 import java.util.*
@@ -20,6 +22,7 @@ class APIController {
     private lateinit var orderPayer: OrderPayer
 
     @PostMapping("/users")
+    @RateLimited(ApiEndpoint.CREATE_USER)
     fun createUser(@RequestBody req: CreateUserRequest): User {
         return User(UUID.randomUUID(), req.name)
     }
@@ -29,6 +32,7 @@ class APIController {
     data class User(val id: UUID, val name: String)
 
     @PostMapping("/orders")
+    @RateLimited(ApiEndpoint.CREATE_ORDER)
     fun createOrder(@RequestParam userId: UUID, @RequestParam price: Int): Order {
         val order = Order(
             UUID.randomUUID(),
@@ -55,6 +59,7 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
+    @RateLimited(ApiEndpoint.PAY_ORDER)
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto {
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
