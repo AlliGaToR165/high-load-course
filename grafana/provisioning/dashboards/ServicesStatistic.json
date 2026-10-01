@@ -3468,6 +3468,57 @@
       ],
       "title": "Jetty Statistics",
       "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 7
+      },
+      "id": 101,
+      "panels": [
+        {
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 8
+          },
+          "id": 102,
+          "targets": [
+            {
+              "expr": "payment_inflight",
+              "legendFormat": "{{account}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Payments Inflight",
+          "type": "timeseries"
+        },
+        {
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 8
+          },
+          "id": 103,
+          "targets": [
+            {
+              "expr": "increase(payment_deadline_dropped_total[$__range])",
+              "instant": true,
+              "legendFormat": "{{account}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Dropped by deadline",
+          "type": "stat"
+        }
+      ],
+      "title": "Payments window",
+      "type": "row"
     }
   ],
   "preload": false,
