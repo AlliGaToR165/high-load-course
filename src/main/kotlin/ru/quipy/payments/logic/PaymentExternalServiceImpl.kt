@@ -135,15 +135,15 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    private fun hasEnoughTime(deadline: Long): Boolean {
-        return deadline - now() >= requestAverageProcessingTime.toMillis()
-    }
+    private fun remainingTimeMs(deadline: Long): Long = deadline - now()
+
+    private fun maxWaitMs(deadline: Long): Long = remainingTimeMs(deadline) - requestAverageProcessingTime.toMillis()
+
+    private fun hasEnoughTime(deadline: Long): Boolean = maxWaitMs(deadline) >= 0
 
     private fun acquireWindow(deadline: Long): Boolean {
-        val remainingTime = deadline - now()
-
-        // Это максимум, который имеет смысл ждать. Если не дождались за это время места в очереди, нет смысла обрабатывать дальше запрос
-        val maxWaitMillis = remainingTime - requestAverageProcessingTime.toMillis()
+        // Если не дождались за это время места в очереди, нет смысла обрабатывать дальше запрос
+        val maxWaitMillis = maxWaitMs(deadline)
         val waitStartedAt = System.nanoTime()
         waitingForWindow.incrementAndGet() // увеличиваем датчик в моменте, т.к +1 запрос начинает ждать в очереди
         try {
