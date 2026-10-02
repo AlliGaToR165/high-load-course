@@ -84,10 +84,9 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         try {
-            rateLimiter.tickBlocking() // Если в текущую секунду уже >= rateLimitPerSec запросов, осташиеся в семафоре ждут
+            val acquired = rateLimiter.tickBlocking { !hasEnoughTime(deadline) }
 
-            // Если, пока ждали очереди из-за лимитера, не хватает времени, то падаем
-            if (!hasEnoughTime(deadline)) {
+            if (!acquired || !hasEnoughTime(deadline)) {
                 dropByDeadline(paymentId, transactionId, "after waiting for rate limiter")
                 return
             }
