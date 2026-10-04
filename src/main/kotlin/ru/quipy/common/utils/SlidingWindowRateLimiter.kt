@@ -33,10 +33,12 @@ class SlidingWindowRateLimiter(
         }
     }
 
-    fun tickBlocking() {
+    fun tickBlocking(shouldAbort: () -> Boolean = { false }): Boolean {
         while (!tick()) {
+            if (shouldAbort()) return false
             Thread.sleep(10)
         }
+        return true
     }
 
     data class Measure(

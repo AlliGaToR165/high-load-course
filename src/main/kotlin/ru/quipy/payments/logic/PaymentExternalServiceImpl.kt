@@ -2,15 +2,22 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.Tags
+import io.micrometer.core.instrument.Timer
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 
 // Advice: always treat time as a Duration
@@ -36,6 +43,21 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
+    private val window = Semaphore(parallelRequests, true) // true - честный семафор, т.е раньше пришел -> раньше получил место в очереди
+
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+
+    private val metricTags = Tags.of("account", accountName)
+    private val deadlineDropped = Metrics.counter("payment_deadline_dropped", metricTags) // счетчик, сколько запросов реджектнули из-за просрочки дедлайна
+    private val windowWaitTimer = Timer.builder("payment_window_wait") // таймер, сколько ждали свободного места в семафоре
+        .tags(metricTags)
+        .register(Metrics.globalRegistry)
+    private val waitingForWindow = AtomicInteger(0)
+    init {
+        Metrics.gauge("payment_waiting_for_window", metricTags, waitingForWindow) { it.get().toDouble() } //  датчик, сколько щас ждет очереди в семафоре
+        Metrics.gauge("payment_inflight", metricTags, window) { (parallelRequests - it.availablePermits()).toDouble() } // датчик, сколько щас занято мест в семафоре
+    }
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
@@ -49,7 +71,26 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
+        // Если оставшегося времени не хватает даже на обработку, то т.к + ожидание места в семафора, по времени точно не успеем
+        if (!hasEnoughTime(deadline)) {
+            dropByDeadline(paymentId, transactionId, "before waiting for window")
+            return
+        }
+
+        // Если ждем места в семафоре больше максимального допустимого времени (оставшееся время - время на обработку запроса), тоже не успеваем
+        if (!acquireWindow(deadline)) {
+            dropByDeadline(paymentId, transactionId, "no free window slot in time")
+            return
+        }
+
         try {
+            val acquired = rateLimiter.tickBlocking { !hasEnoughTime(deadline) }
+
+            if (!acquired || !hasEnoughTime(deadline)) {
+                dropByDeadline(paymentId, transactionId, "after waiting for rate limiter")
+                return
+            }
+
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
@@ -88,6 +129,34 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            window.release()
+        }
+    }
+
+    private fun remainingTimeMs(deadline: Long): Long = deadline - now()
+
+    private fun maxWaitMs(deadline: Long): Long = remainingTimeMs(deadline) - requestAverageProcessingTime.toMillis()
+
+    private fun hasEnoughTime(deadline: Long): Boolean = maxWaitMs(deadline) >= 0
+
+    private fun acquireWindow(deadline: Long): Boolean {
+        // Если не дождались за это время места в очереди, нет смысла обрабатывать дальше запрос
+        val maxWaitMillis = maxWaitMs(deadline)
+        val waitStartedAt = System.nanoTime()
+        waitingForWindow.incrementAndGet() // увеличиваем датчик в моменте, т.к +1 запрос начинает ждать в очереди
+        try {
+            return window.tryAcquire(maxWaitMillis, TimeUnit.MILLISECONDS)
+        } finally {
+            waitingForWindow.decrementAndGet() // уменьшаем датчик, т.к больше не ждем
+            windowWaitTimer.record(System.nanoTime() - waitStartedAt, TimeUnit.NANOSECONDS)
+        }
+    }
+
+    private fun dropByDeadline(paymentId: UUID, transactionId: UUID, msg: String) {
+        deadlineDropped.increment()
+        paymentESService.update(paymentId) {
+            it.logProcessing(false, now(), transactionId, reason = "Deadline would be missed: $msg")
         }
     }
 
