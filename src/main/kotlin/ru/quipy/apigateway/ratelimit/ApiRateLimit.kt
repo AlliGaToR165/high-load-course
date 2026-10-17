@@ -80,13 +80,13 @@ class ConfiguredPaymentAccounts(
 }
 
 class EndpointRateLimiterRegistry(
-    private val limiterFactories: Map<ApiEndpoint, () -> ConfiguredEndpointRateLimiter>,
+    private val limiterFactories: Map<ApiEndpoint, (RateLimitKey) -> ConfiguredEndpointRateLimiter>,
 ) : EndpointRateLimitPolicy {
     private val limiters = ConcurrentHashMap<RateLimitKey, ConfiguredEndpointRateLimiter>()
 
     override fun check(key: RateLimitKey): RateLimitDecision {
         val limiter = limiters.computeIfAbsent(key) {
-            limiterFactories.getValue(key.endpoint).invoke()
+            limiterFactories.getValue(key.endpoint).invoke(key)
         }
         return RateLimitDecision(
             limiter.rateLimiter.tick(),
@@ -126,19 +126,34 @@ class RateLimitInterceptor(
 @EnableConfigurationProperties(ApiRateLimitProperties::class)
 class ApiRateLimitConfiguration {
     @Bean
-    fun endpointRateLimitPolicy(properties: ApiRateLimitProperties): EndpointRateLimitPolicy {
+    fun endpointRateLimitPolicy(
+        properties: ApiRateLimitProperties,
+        payOrderCapacityByAccount: Map<String, Long>,
+    ): EndpointRateLimitPolicy {
         return EndpointRateLimiterRegistry(
             mapOf(
                 ApiEndpoint.AUTHENTICATION to properties.authentication.toRateLimiterFactory(),
                 ApiEndpoint.AUTHENTICATION_REFRESH to properties.authenticationRefresh.toRateLimiterFactory(),
                 ApiEndpoint.CREATE_USER to properties.createUser.toRateLimiterFactory(),
                 ApiEndpoint.CREATE_ORDER to properties.createOrder.toRateLimiterFactory(),
-                ApiEndpoint.PAY_ORDER to properties.payOrder.toRateLimiterFactory(),
+                ApiEndpoint.PAY_ORDER to payOrderFactory(properties.payOrder, payOrderCapacityByAccount),
             )
         )
     }
 
-    private fun EndpointRateLimitProperties.toRateLimiterFactory(): () -> ConfiguredEndpointRateLimiter {
+    private fun payOrderFactory(
+        properties: EndpointRateLimitProperties,
+        capacityByAccount: Map<String, Long>,
+    ): (RateLimitKey) -> ConfiguredEndpointRateLimiter {
+        return { key ->
+            ConfiguredEndpointRateLimiter(
+                SlidingWindowRateLimiter(capacityByAccount[key.accountName] ?: properties.rate, properties.window),
+                properties.retryAfter.seconds,
+            )
+        }
+    }
+
+    private fun EndpointRateLimitProperties.toRateLimiterFactory(): (RateLimitKey) -> ConfiguredEndpointRateLimiter {
         require(rate > 0) { "Rate limit must be positive" }
         require(!window.isZero && !window.isNegative) { "Rate limit window must be positive" }
         require(retryAfter.seconds > 0 && retryAfter.nano == 0) {
@@ -148,7 +163,7 @@ class ApiRateLimitConfiguration {
         val configuredRate = rate
         val configuredWindow = window
         val configuredRetryAfterSeconds = retryAfter.seconds
-        return {
+        return { _: RateLimitKey ->
             ConfiguredEndpointRateLimiter(
                 SlidingWindowRateLimiter(configuredRate, configuredWindow),
                 configuredRetryAfterSeconds,

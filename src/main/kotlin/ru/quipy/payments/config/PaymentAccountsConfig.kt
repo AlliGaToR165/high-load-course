@@ -36,7 +36,7 @@ class PaymentAccountsConfig {
     lateinit var allowedAccounts: List<String>
 
     @Bean
-    fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>): List<PaymentExternalSystemAdapter> {
+    fun paymentAccountProperties(): List<PaymentAccountProperties> {
         val request = HttpRequest.newBuilder()
             .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
             .GET()
@@ -52,13 +52,33 @@ class PaymentAccountsConfig {
             .filter { it.accountName in allowedAccounts }
             .map { it.copy(enabled = true) }
             .onEach(::println)
-            .map {
-                PaymentExternalSystemAdapterImpl(
-                    it,
-                    paymentService,
-                    paymentProviderHostPort,
-                    token
-                )
+    }
+
+    @Bean
+    fun accountAdapters(
+        paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
+        paymentAccountProperties: List<PaymentAccountProperties>,
+    ): List<PaymentExternalSystemAdapter> {
+        return paymentAccountProperties.map {
+            PaymentExternalSystemAdapterImpl(
+                it,
+                paymentService,
+                paymentProviderHostPort,
+                token
+            )
+        }
+    }
+
+    @Bean
+    fun payOrderCapacityByAccount(paymentAccountProperties: List<PaymentAccountProperties>): Map<String, Long> {
+        return paymentAccountProperties.associate { account ->
+            val avgMillis = account.averageProcessingTime.toMillis()
+            val capacity = if (avgMillis <= 0) {
+                1L
+            } else {
+                (account.parallelRequests * 1000L / avgMillis).coerceAtLeast(1)
             }
+            account.accountName to capacity
+        }
     }
 }
