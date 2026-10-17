@@ -6,6 +6,7 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import ru.quipy.apigateway.ratelimit.PaymentCallAdmission
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.*
@@ -58,27 +59,17 @@ class PaymentAccountsConfig {
     fun accountAdapters(
         paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
         paymentAccountProperties: List<PaymentAccountProperties>,
+        paymentCallAdmission: PaymentCallAdmission,
     ): List<PaymentExternalSystemAdapter> {
         return paymentAccountProperties.map {
             PaymentExternalSystemAdapterImpl(
                 it,
                 paymentService,
                 paymentProviderHostPort,
-                token
+                token,
+                paymentCallAdmission
             )
         }
     }
 
-    @Bean
-    fun payOrderCapacityByAccount(paymentAccountProperties: List<PaymentAccountProperties>): Map<String, Long> {
-        return paymentAccountProperties.associate { account ->
-            val avgMillis = account.averageProcessingTime.toMillis()
-            val capacity = if (avgMillis <= 0) {
-                1L
-            } else {
-                (account.parallelRequests * 1000L / avgMillis).coerceAtLeast(1)
-            }
-            account.accountName to capacity
-        }
-    }
 }

@@ -43,7 +43,6 @@ class ApiRateLimitProperties {
     var authenticationRefresh = EndpointRateLimitProperties()
     var createUser = EndpointRateLimitProperties()
     var createOrder = EndpointRateLimitProperties()
-    var payOrder = EndpointRateLimitProperties()
 }
 
 data class RateLimitDecision(
@@ -110,6 +109,8 @@ class RateLimitInterceptor(
             ?.endpoint
             ?: return true
 
+        if (endpoint == ApiEndpoint.PAY_ORDER) return true
+
         val rejection = paymentAccounts.names
             .asSequence()
             .map { accountName -> rateLimitPolicy.check(RateLimitKey(accountName, endpoint)) }
@@ -128,7 +129,6 @@ class ApiRateLimitConfiguration {
     @Bean
     fun endpointRateLimitPolicy(
         properties: ApiRateLimitProperties,
-        payOrderCapacityByAccount: Map<String, Long>,
     ): EndpointRateLimitPolicy {
         return EndpointRateLimiterRegistry(
             mapOf(
@@ -136,21 +136,8 @@ class ApiRateLimitConfiguration {
                 ApiEndpoint.AUTHENTICATION_REFRESH to properties.authenticationRefresh.toRateLimiterFactory(),
                 ApiEndpoint.CREATE_USER to properties.createUser.toRateLimiterFactory(),
                 ApiEndpoint.CREATE_ORDER to properties.createOrder.toRateLimiterFactory(),
-                ApiEndpoint.PAY_ORDER to payOrderFactory(properties.payOrder, payOrderCapacityByAccount),
             )
         )
-    }
-
-    private fun payOrderFactory(
-        properties: EndpointRateLimitProperties,
-        capacityByAccount: Map<String, Long>,
-    ): (RateLimitKey) -> ConfiguredEndpointRateLimiter {
-        return { key ->
-            ConfiguredEndpointRateLimiter(
-                SlidingWindowRateLimiter(capacityByAccount[key.accountName] ?: properties.rate, properties.window),
-                properties.retryAfter.seconds,
-            )
-        }
     }
 
     private fun EndpointRateLimitProperties.toRateLimiterFactory(): (RateLimitKey) -> ConfiguredEndpointRateLimiter {
