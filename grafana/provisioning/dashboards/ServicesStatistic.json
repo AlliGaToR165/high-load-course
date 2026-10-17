@@ -3489,12 +3489,17 @@
           "id": 102,
           "targets": [
             {
-              "expr": "payment_inflight",
-              "legendFormat": "{{account}}",
+              "expr": "payment_admission_inflight",
+              "legendFormat": "in flight",
               "refId": "A"
+            },
+            {
+              "expr": "payment_admission_queued",
+              "legendFormat": "queued",
+              "refId": "B"
             }
           ],
-          "title": "Payments Inflight",
+          "title": "Payments admission",
           "type": "timeseries"
         },
         {
@@ -3517,7 +3522,7 @@
           "type": "stat"
         }
       ],
-      "title": "Payments window",
+      "title": "Payments admission",
       "type": "row"
     }
   ],
