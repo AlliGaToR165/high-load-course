@@ -41,7 +41,7 @@ class PayOrderAdmissionQueueTest {
 
     @Test
     fun `queue capacity follows account throughput and remaining deadline`() {
-        val queue = queue(account(parallelRequests = 5, rateLimitPerSec = 10, processingTime = Duration.ofMillis(4_900)))
+        val queue = queue(account(parallelRequests = 5, rateLimitPerSec = 10, processingTime = Duration.ofMillis(4_900)), safetyMargin = Duration.ofSeconds(5))
         val releases = CopyOnWriteArrayList<() -> Unit>()
         try {
             val deadline = System.currentTimeMillis() + 60_000
@@ -53,7 +53,7 @@ class PayOrderAdmissionQueueTest {
             }
             active.forEach { awaitResult(it) }
 
-            val waiting = (1..55).map {
+            val waiting = (1..45).map {
                 queue.submit(deadline) { onFinished ->
                     onFinished()
                     "waiting"
@@ -76,9 +76,9 @@ class PayOrderAdmissionQueueTest {
 
     @Test
     fun `request is rejected when provider cannot finish before deadline`() {
-        val queue = queue(account(parallelRequests = 5, rateLimitPerSec = 10, processingTime = Duration.ofMillis(4_900)))
+        val queue = queue(account(parallelRequests = 5, rateLimitPerSec = 10, processingTime = Duration.ofMillis(4_900)), safetyMargin = Duration.ofSeconds(5))
         try {
-            val result = queue.submit(System.currentTimeMillis() + 4_000) { onFinished ->
+            val result = queue.submit(System.currentTimeMillis() + 13_000) { onFinished ->
                 onFinished()
                 "too late"
             }
@@ -107,10 +107,10 @@ class PayOrderAdmissionQueueTest {
     private fun account(parallelRequests: Int, rateLimitPerSec: Int, processingTime: Duration) =
         PaymentAccountProperties("service", "acc-5", parallelRequests, rateLimitPerSec, 1, processingTime, true)
 
-    private fun queue(vararg accounts: PaymentAccountProperties): PayOrderAdmissionQueue {
+    private fun queue(vararg accounts: PaymentAccountProperties, safetyMargin: Duration = Duration.ofSeconds(1)): PayOrderAdmissionQueue {
         val settings = PayOrderAdmissionProperties().apply {
             maxQueueSize = 100
-            safetyMargin = Duration.ofSeconds(1)
+            this.safetyMargin = safetyMargin
             retryAfter = Duration.ofSeconds(10)
         }
         return PayOrderAdmissionQueue(accounts.toList(), settings)

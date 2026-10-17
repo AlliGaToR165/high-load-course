@@ -3499,7 +3499,7 @@
               "refId": "B"
             }
           ],
-          "title": "Payments admission",
+          "title": "Queue depth and in-flight payments",
           "type": "timeseries"
         },
         {
@@ -3520,6 +3520,64 @@
           ],
           "title": "Dropped by deadline",
           "type": "stat"
+        },
+        {
+          "fieldConfig": {
+            "defaults": {
+              "min": 0,
+              "unit": "s"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 16
+          },
+          "id": 104,
+          "targets": [
+            {
+              "expr": "rate(payment_admission_wait_seconds_sum[$__rate_interval]) / rate(payment_admission_wait_seconds_count[$__rate_interval])",
+              "legendFormat": "average {{job}} {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "max_over_time(payment_admission_wait_seconds_max[$__rate_interval])",
+              "legendFormat": "maximum {{job}} {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "title": "Queue wait time",
+          "type": "timeseries"
+        },
+        {
+          "fieldConfig": {
+            "defaults": {
+              "min": 0,
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 16
+          },
+          "id": 105,
+          "targets": [
+            {
+              "expr": "sum by (job) (rate(payment_admission_wait_seconds_count[$__rate_interval]))",
+              "legendFormat": "dispatched {{job}}",
+              "refId": "A"
+            },
+            {
+              "expr": "sum by (job, reason) (rate(payment_admission_rejected_total[$__rate_interval]))",
+              "legendFormat": "rejected {{reason}} {{job}}",
+              "refId": "B"
+            }
+          ],
+          "title": "Dispatch and rejection rate",
+          "type": "timeseries"
         }
       ],
       "title": "Payments admission",
