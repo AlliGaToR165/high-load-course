@@ -17,7 +17,7 @@ class OrderPayer {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-        const val PAYMENT_WORKER_COUNT = 16
+        const val PAYMENT_WORKER_COUNT = 128
     }
 
     @Autowired

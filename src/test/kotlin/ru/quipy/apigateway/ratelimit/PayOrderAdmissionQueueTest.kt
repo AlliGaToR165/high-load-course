@@ -41,7 +41,7 @@ class PayOrderAdmissionQueueTest {
 
     @Test
     fun `queue capacity follows account throughput and remaining deadline`() {
-        val queue = queue(account(parallelRequests = 5, rateLimitPerSec = 10, processingTime = Duration.ofMillis(4_900)), safetyMargin = Duration.ofSeconds(5))
+        val queue = queue(account(parallelRequests = 5, rateLimitPerSec = 10, processingTime = Duration.ofMillis(4_900)))
         val releases = CopyOnWriteArrayList<() -> Unit>()
         try {
             val deadline = System.currentTimeMillis() + 60_000
@@ -67,7 +67,45 @@ class PayOrderAdmissionQueueTest {
             }
             val response = awaitResult(rejected) as ResponseEntity<*>
             assertEquals(429, response.statusCode.value())
-            assertEquals("10", response.headers.getFirst(HttpHeaders.RETRY_AFTER))
+            assertTrue(response.headers.getFirst(HttpHeaders.RETRY_AFTER)!!.toLong() > 10)
+        } finally {
+            releases.forEach { it.invoke() }
+            queue.close()
+        }
+    }
+
+    @Test
+    fun `rejected requests receive separate retry slots`() {
+        val queue = queue(
+            account(parallelRequests = 1, rateLimitPerSec = 1, processingTime = Duration.ofSeconds(1)),
+            maxQueueSize = 1,
+            retryAfter = Duration.ofSeconds(1),
+        )
+        val releases = CopyOnWriteArrayList<() -> Unit>()
+        try {
+            val deadline = System.currentTimeMillis() + 10_000
+            val active = queue.submit(deadline) { onFinished ->
+                releases.add(onFinished)
+                "active"
+            }
+            assertEquals("active", awaitResult(active))
+
+            val waiting = queue.submit(deadline) { onFinished ->
+                onFinished()
+                "waiting"
+            }
+            assertFalse(waiting.hasResult())
+
+            val firstRejected = queue.submit(deadline) { onFinished ->
+                onFinished()
+                "first rejected"
+            }
+            val secondRejected = queue.submit(deadline) { onFinished ->
+                onFinished()
+                "second rejected"
+            }
+            assertEquals("1", (awaitResult(firstRejected) as ResponseEntity<*>).headers.getFirst(HttpHeaders.RETRY_AFTER))
+            assertEquals("2", (awaitResult(secondRejected) as ResponseEntity<*>).headers.getFirst(HttpHeaders.RETRY_AFTER))
         } finally {
             releases.forEach { it.invoke() }
             queue.close()
@@ -76,14 +114,29 @@ class PayOrderAdmissionQueueTest {
 
     @Test
     fun `request is rejected when provider cannot finish before deadline`() {
-        val queue = queue(account(parallelRequests = 5, rateLimitPerSec = 10, processingTime = Duration.ofMillis(4_900)), safetyMargin = Duration.ofSeconds(5))
+        val queue = queue(account(parallelRequests = 5, rateLimitPerSec = 10, processingTime = Duration.ofMillis(4_900)))
         try {
-            val result = queue.submit(System.currentTimeMillis() + 13_000) { onFinished ->
+            val result = queue.submit(System.currentTimeMillis() + 10_000) { onFinished ->
                 onFinished()
                 "too late"
             }
 
             assertEquals(429, (awaitResult(result) as ResponseEntity<*>).statusCode.value())
+        } finally {
+            queue.close()
+        }
+    }
+
+    @Test
+    fun `relative safety margin admits a three second deadline`() {
+        val queue = queue(account(parallelRequests = 16, rateLimitPerSec = 110, processingTime = Duration.ofSeconds(1)))
+        try {
+            val result = queue.submit(System.currentTimeMillis() + 3_000) { onFinished ->
+                onFinished()
+                "accepted"
+            }
+
+            assertEquals("accepted", awaitResult(result))
         } finally {
             queue.close()
         }
@@ -107,11 +160,14 @@ class PayOrderAdmissionQueueTest {
     private fun account(parallelRequests: Int, rateLimitPerSec: Int, processingTime: Duration) =
         PaymentAccountProperties("service", "acc-5", parallelRequests, rateLimitPerSec, 1, processingTime, true)
 
-    private fun queue(vararg accounts: PaymentAccountProperties, safetyMargin: Duration = Duration.ofSeconds(1)): PayOrderAdmissionQueue {
+    private fun queue(
+        vararg accounts: PaymentAccountProperties,
+        maxQueueSize: Int = 100,
+        retryAfter: Duration = Duration.ofSeconds(10),
+    ): PayOrderAdmissionQueue {
         val settings = PayOrderAdmissionProperties().apply {
-            maxQueueSize = 100
-            this.safetyMargin = safetyMargin
-            retryAfter = Duration.ofSeconds(10)
+            this.maxQueueSize = maxQueueSize
+            this.retryAfter = retryAfter
         }
         return PayOrderAdmissionQueue(accounts.toList(), settings)
     }

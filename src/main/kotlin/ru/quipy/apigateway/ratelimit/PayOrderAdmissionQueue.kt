@@ -28,7 +28,7 @@ import kotlin.math.floor
 @ConfigurationProperties(prefix = "api.pay-order-admission")
 class PayOrderAdmissionProperties {
     var maxQueueSize: Int = 2_000
-    var safetyMargin: Duration = Duration.ofSeconds(5)
+    var safetyMarginFactor: Double = 0.1
     var processingTimeReserveFactor: Double = 2.0
     var retryAfter: Duration = Duration.ofSeconds(1)
 }
@@ -67,20 +67,25 @@ class PayOrderAdmissionQueue(
     }.coerceAtMost(maxConcurrent * 1_000.0 / processingBudgetMs)
     private val rateWindows = accounts.associate { it.accountName to ArrayDeque<Long>() }
     private val actualCallWindows = accounts.associate { it.accountName to ArrayDeque<Long>() }
+    private val retrySlotIntervalNanos = ceil(TimeUnit.SECONDS.toNanos(1) / sustainableRatePerSecond).toLong().coerceAtLeast(1)
     private val lock = ReentrantLock()
     private val changed = lock.newCondition()
     private val requests = ArrayDeque<QueuedRequest>()
+    private var nextRetrySlotNanos = 0L
     private val dispatcher = Executors.newSingleThreadExecutor(NamedThreadFactory("pay-order-admission"))
     private val handoff = Executors.newFixedThreadPool(maxConcurrent, NamedThreadFactory("pay-order-handoff"))
     private val inFlight = AtomicInteger(0)
     private val closed = AtomicBoolean(false)
     private val rejectedByCapacity = Metrics.counter("payment_admission_rejected", "reason", "capacity")
     private val rejectedByDeadline = Metrics.counter("payment_admission_rejected", "reason", "deadline")
+    private val retryAfter = Metrics.summary("payment_admission_retry_after_seconds")
     private val queueWait = Metrics.timer("payment_admission_wait")
 
     init {
         require(settings.maxQueueSize > 0) { "Pay order queue capacity must be positive" }
-        require(!settings.safetyMargin.isNegative) { "Pay order safety margin must not be negative" }
+        require(settings.safetyMarginFactor.isFinite() && settings.safetyMarginFactor >= 0.0 && settings.safetyMarginFactor < 1.0) {
+            "Pay order safety margin factor must be finite and between 0 (inclusive) and 1 (exclusive)"
+        }
         require(settings.processingTimeReserveFactor.isFinite() && settings.processingTimeReserveFactor >= 1.0) {
             "Pay order processing time reserve factor must be finite and at least 1"
         }
@@ -94,8 +99,10 @@ class PayOrderAdmissionQueue(
     }
 
     override fun <T : Any> submit(deadline: Long, action: (onFinished: () -> Unit) -> T): DeferredResult<T> {
-        val result = DeferredResult<T>((deadline - System.currentTimeMillis()).coerceAtLeast(1))
-        val request = QueuedRequest(deadline, {
+        val nowMs = System.currentTimeMillis()
+        val safetyMarginMs = ceil((deadline - nowMs).coerceAtLeast(0).toDouble() * settings.safetyMarginFactor).toLong()
+        val result = DeferredResult<T>((deadline - nowMs).coerceAtLeast(1))
+        val request = QueuedRequest(deadline, safetyMarginMs, {
             val released = AtomicBoolean(false)
             val onFinished = {
                 if (released.compareAndSet(false, true)) releaseSlot()
@@ -106,20 +113,20 @@ class PayOrderAdmissionQueue(
                 onFinished()
                 result.setErrorResult(exception)
             }
-        }, {
-            result.setErrorResult(rateLimitResponse())
+        }, { retryAfterSeconds ->
+            result.setErrorResult(rateLimitResponse(retryAfterSeconds))
         })
 
         result.onTimeout { cancelRequest(request, true) }
         result.onCompletion { cancelRequest(request, false) }
 
-        val nowMs = System.currentTimeMillis()
+        val admissionNowMs = System.currentTimeMillis()
         val rejectionReason = lock.withLock {
             when {
                 closed.get() -> "capacity"
-                !hasProcessingTime(deadline, nowMs) -> "deadline"
+                !hasProcessingTime(deadline, admissionNowMs, safetyMarginMs) -> "deadline"
                 requests.size >= settings.maxQueueSize -> "capacity"
-                !canAdmit(deadline, nowMs, System.nanoTime()) -> "deadline"
+                !canAdmit(deadline, admissionNowMs, safetyMarginMs, System.nanoTime()) -> "deadline"
                 else -> {
                     requests.addLast(request)
                     changed.signal()
@@ -159,10 +166,10 @@ class PayOrderAdmissionQueue(
         return false
     }
 
-    private fun canAdmit(deadline: Long, nowMs: Long, nowNanos: Long): Boolean {
+    private fun canAdmit(deadline: Long, nowMs: Long, safetyMarginMs: Long, nowNanos: Long): Boolean {
         expireRateWindows(nowNanos)
         val ahead = requests.size
-        val waitingBudgetMs = deadline - nowMs - processingTimeReserveMs - settings.safetyMargin.toMillis()
+        val waitingBudgetMs = deadline - nowMs - processingTimeReserveMs - safetyMarginMs
         val dynamicLimit = floor(sustainableRatePerSecond * waitingBudgetMs / 1_000.0).toInt()
         val canStartImmediately = ahead == 0 && canStart(nowNanos)
         if (!canStartImmediately && ahead + 1 > dynamicLimit) return false
@@ -177,7 +184,7 @@ class PayOrderAdmissionQueue(
                 ((ahead + 1 - available + account.rateLimitPerSec - 1) / account.rateLimitPerSec).toLong() * 1_000L
         }
         val predictedWaitMs = maxOf(concurrencyWaitMs, rateWaitMs)
-        return predictedWaitMs + processingTimeReserveMs + settings.safetyMargin.toMillis() <= deadline - nowMs
+        return predictedWaitMs + processingTimeReserveMs + safetyMarginMs <= deadline - nowMs
     }
 
     private fun dispatchRequests() {
@@ -193,7 +200,7 @@ class PayOrderAdmissionQueue(
                             val request = iterator.next()
                             if (!request.isPending()) {
                                 iterator.remove()
-                            } else if (!hasProcessingTime(request.deadline, nowMs)) {
+                            } else if (!hasProcessingTime(request.deadline, nowMs, request.safetyMarginMs)) {
                                 iterator.remove()
                                 expired.add(request)
                             }
@@ -227,8 +234,8 @@ class PayOrderAdmissionQueue(
         }
     }
 
-    private fun hasProcessingTime(deadline: Long, nowMs: Long): Boolean =
-        deadline - nowMs > processingTimeReserveMs + settings.safetyMargin.toMillis()
+    private fun hasProcessingTime(deadline: Long, nowMs: Long, safetyMarginMs: Long): Boolean =
+        deadline - nowMs > processingTimeReserveMs + safetyMarginMs
 
     private fun canStart(nowNanos: Long): Boolean {
         if (inFlight.get() >= maxConcurrent) return false
@@ -273,13 +280,31 @@ class PayOrderAdmissionQueue(
         val previousState = request.stopBeforeExecution()
         if (previousState >= 0) {
             if (previousState == 1) releaseSlot()
+            val retryAfterSeconds = retryAfterSeconds()
+            retryAfter.record(retryAfterSeconds.toDouble())
             if (reason == "capacity") rejectedByCapacity.increment() else rejectedByDeadline.increment()
-            request.reject()
+            request.reject(retryAfterSeconds)
         }
     }
 
-    private fun rateLimitResponse(): ResponseEntity<Void> = ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-        .header(HttpHeaders.RETRY_AFTER, settings.retryAfter.seconds.toString())
+    private fun retryAfterSeconds(): Long = lock.withLock {
+        val nowNanos = System.nanoTime()
+        expireRateWindows(nowNanos)
+        val rateWaitNanos = accounts.maxOf { account ->
+            val timestamps = rateWindows.getValue(account.accountName)
+            if (timestamps.size < account.rateLimitPerSec) 0L else
+                (timestamps.first + TimeUnit.SECONDS.toNanos(1) - nowNanos).coerceAtLeast(0)
+        }
+        val slotWaitNanos = if (inFlight.get() >= maxConcurrent) TimeUnit.MILLISECONDS.toNanos(processingBudgetMs) else 0L
+        val queueWaitNanos = ceil(requests.size * TimeUnit.SECONDS.toNanos(1) / sustainableRatePerSecond).toLong()
+        val earliestRetryNanos = nowNanos + maxOf(settings.retryAfter.toNanos(), rateWaitNanos, slotWaitNanos, queueWaitNanos)
+        val scheduledRetryNanos = maxOf(earliestRetryNanos, nextRetrySlotNanos)
+        nextRetrySlotNanos = scheduledRetryNanos + retrySlotIntervalNanos
+        ceil((scheduledRetryNanos - nowNanos).toDouble() / TimeUnit.SECONDS.toNanos(1)).toLong().coerceAtLeast(1)
+    }
+
+    private fun rateLimitResponse(retryAfterSeconds: Long): ResponseEntity<Void> = ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+        .header(HttpHeaders.RETRY_AFTER, retryAfterSeconds.toString())
         .build()
 
     private fun queueSize(): Int = lock.withLock { requests.size }
@@ -300,8 +325,9 @@ class PayOrderAdmissionQueue(
 
     private class QueuedRequest(
         val deadline: Long,
+        val safetyMarginMs: Long,
         private val executeAction: () -> Unit,
-        private val rejectAction: () -> Unit,
+        private val rejectAction: (Long) -> Unit,
     ) {
         val enqueuedAtNanos = System.nanoTime()
         private val state = AtomicInteger(0)
@@ -311,7 +337,7 @@ class PayOrderAdmissionQueue(
         fun execute() {
             if (state.compareAndSet(1, 3)) executeAction()
         }
-        fun reject() = rejectAction()
+        fun reject(retryAfterSeconds: Long) = rejectAction(retryAfterSeconds)
         fun stopBeforeExecution(): Int {
             while (true) {
                 val current = state.get()
