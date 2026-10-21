@@ -40,12 +40,28 @@ class RateLimitInterceptorTest {
         val passed = interceptor.preHandle(
             MockHttpServletRequest(),
             response,
-            handler("payOrder"),
+            handler("createUser"),
         )
 
         assertFalse(passed)
         assertEquals(429, response.status)
         assertEquals("3", response.getHeader(HttpHeaders.RETRY_AFTER))
+    }
+
+    @Test
+    fun `pay order is handled by admission queue instead of interceptor`() {
+        val interceptor = RateLimitInterceptor(
+            EndpointRateLimitPolicy { error("PAY_ORDER must not be checked by the interceptor") },
+            ConfiguredPaymentAccounts("acc-3"),
+        )
+
+        val passed = interceptor.preHandle(
+            MockHttpServletRequest(),
+            MockHttpServletResponse(),
+            handler("payOrder"),
+        )
+
+        assertTrue(passed)
     }
 
     @Test
