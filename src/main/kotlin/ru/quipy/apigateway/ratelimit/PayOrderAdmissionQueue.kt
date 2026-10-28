@@ -179,9 +179,13 @@ class PayOrderAdmissionQueue(
             (ahead + 1 - freeSlots + maxConcurrent - 1) / maxConcurrent
         val concurrencyWaitMs = concurrencyWaves.toLong() * processingBudgetMs
         val rateWaitMs = accounts.maxOf { account ->
-            val available = account.rateLimitPerSec - rateWindows.getValue(account.accountName).size
-            if (ahead + 1 <= available) 0L else
-                ((ahead + 1 - available + account.rateLimitPerSec - 1) / account.rateLimitPerSec).toLong() * 1_000L
+            val timestamps = rateWindows.getValue(account.accountName)
+            val missingPermits = ahead + 1 - (account.rateLimitPerSec - timestamps.size)
+            if (missingPermits <= 0) 0L else {
+                val firstPermitMs = if (timestamps.isEmpty()) 0L else
+                    TimeUnit.NANOSECONDS.toMillis((timestamps.first + TimeUnit.SECONDS.toNanos(1) - nowNanos).coerceAtLeast(0))
+                firstPermitMs + ceil((missingPermits - 1) * 1_000.0 / account.rateLimitPerSec).toLong()
+            }
         }
         val predictedWaitMs = maxOf(concurrencyWaitMs, rateWaitMs)
         return predictedWaitMs + processingTimeReserveMs + safetyMarginMs <= deadline - nowMs
