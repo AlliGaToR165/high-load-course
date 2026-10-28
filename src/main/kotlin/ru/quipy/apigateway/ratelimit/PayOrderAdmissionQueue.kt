@@ -23,7 +23,6 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.math.ceil
-import kotlin.math.floor
 
 @ConfigurationProperties(prefix = "api.pay-order-admission")
 class PayOrderAdmissionProperties {
@@ -169,22 +168,19 @@ class PayOrderAdmissionQueue(
     private fun canAdmit(deadline: Long, nowMs: Long, safetyMarginMs: Long, nowNanos: Long): Boolean {
         expireRateWindows(nowNanos)
         val ahead = requests.size
-        val waitingBudgetMs = deadline - nowMs - processingTimeReserveMs - safetyMarginMs
-        val dynamicLimit = floor(sustainableRatePerSecond * waitingBudgetMs / 1_000.0).toInt()
-        val canStartImmediately = ahead == 0 && canStart(nowNanos)
-        if (!canStartImmediately && ahead + 1 > dynamicLimit) return false
-
         val freeSlots = maxConcurrent - inFlight.get()
         val concurrencyWaves = if (ahead < freeSlots) 0 else
             (ahead + 1 - freeSlots + maxConcurrent - 1) / maxConcurrent
         val concurrencyWaitMs = concurrencyWaves.toLong() * processingBudgetMs
         val rateWaitMs = accounts.maxOf { account ->
             val timestamps = rateWindows.getValue(account.accountName)
-            val missingPermits = ahead + 1 - (account.rateLimitPerSec - timestamps.size)
-            if (missingPermits <= 0) 0L else {
-                val firstPermitMs = if (timestamps.isEmpty()) 0L else
-                    TimeUnit.NANOSECONDS.toMillis((timestamps.first + TimeUnit.SECONDS.toNanos(1) - nowNanos).coerceAtLeast(0))
-                firstPermitMs + ceil((missingPermits - 1) * 1_000.0 / account.rateLimitPerSec).toLong()
+            val rate = account.rateLimitPerSec
+            val permit = ahead + 1 - (rate - timestamps.size)
+            if (permit <= 0) 0L else {
+                val index = (permit - 1) % rate
+                val cycles = (permit - 1) / rate + 1
+                val stampNanos = if (index < timestamps.size) timestamps.elementAt(index) else nowNanos
+                TimeUnit.NANOSECONDS.toMillis((stampNanos + cycles * TimeUnit.SECONDS.toNanos(1) - nowNanos).coerceAtLeast(0))
             }
         }
         val predictedWaitMs = maxOf(concurrencyWaitMs, rateWaitMs)
@@ -220,7 +216,7 @@ class PayOrderAdmissionQueue(
                             }
                         }
                         if (selected == null && expired.isEmpty() && !closed.get()) {
-                            changed.awaitNanos(TimeUnit.MILLISECONDS.toNanos(10))
+                            changed.awaitNanos(nextDispatchCheckNanos(System.nanoTime()))
                         }
                     }
                 }
@@ -245,6 +241,17 @@ class PayOrderAdmissionQueue(
         if (inFlight.get() >= maxConcurrent) return false
         expireRateWindows(nowNanos)
         return accounts.all { rateWindows.getValue(it.accountName).size < it.rateLimitPerSec }
+    }
+
+    private fun nextDispatchCheckNanos(nowNanos: Long): Long {
+        val maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(10)
+        if (requests.isEmpty() || inFlight.get() >= maxConcurrent) return maxWaitNanos
+        val permitNanos = accounts.maxOf { account ->
+            val timestamps = rateWindows.getValue(account.accountName)
+            if (timestamps.size < account.rateLimitPerSec) 0L
+            else timestamps.first + TimeUnit.SECONDS.toNanos(1) - nowNanos
+        }
+        return permitNanos.coerceIn(1, maxWaitNanos)
     }
 
     private fun expireRateWindows(nowNanos: Long) {
