@@ -64,13 +64,6 @@ class PaymentExternalSystemAdapterImpl(
         }
         .build()
 
-    init {
-        require(maxAttempts > 0) { "Payment max attempts must be positive" }
-        require(processingTimeFactor.isFinite() && processingTimeFactor > 0 && processingTimeFactor <= 1) {
-            "Payment retry processing time factor must be finite, greater than zero and at most one"
-        }
-    }
-
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         var retryDelayMs = 0L
         repeat(maxAttempts) { attempt ->
