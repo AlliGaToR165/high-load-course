@@ -8,6 +8,9 @@ RUN mvn package
 
 FROM eclipse-temurin:17-alpine-3.22
 
+ENV PAYMENT_ATTEMPT_TIMEOUT=1500ms
+ENV PAYMENT_RESPONSE_TIMEOUT_RESERVE=300ms
+
 COPY --from=build /app/target/*.jar /high-load-course.jar
 
 CMD ["java", "-jar", "/high-load-course.jar"]

@@ -76,6 +76,10 @@ class PaymentExternalSystemAdapterImpl(
         }
         .build()
 
+    init {
+        logger.info("[$accountName] Payment retry configuration: attemptTimeout=$attemptTimeout, responseTimeoutReserve=$responseTimeoutReserve, maxAttempts=$maxAttempts, retryableStatuses=$retryableStatuses")
+    }
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         var retryDelayMs = 0L
         var retryReason: String? = null

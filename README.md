@@ -45,7 +45,15 @@ PAYMENT_ACCOUNTS=acc-7 PAYMENT_HOST=127.0.0.1 PAYMENT_ATTEMPT_TIMEOUT=1500ms PAY
 
 `PAYMENT_ATTEMPT_TIMEOUT` limits provider processing per attempt. The client also reserves `PAYMENT_RESPONSE_TIMEOUT_RESERVE` to receive the response, within the original payment deadline. Every attempt acquires the account rate permit. HTTP 408 is retried only when enabled in `PAYMENT_RETRY_HTTP_STATUSES` and the provider confirms `result=false` with message `Timeout`; unknown network outcomes are not retried.
 
-The attempt timeout defaults to `0ms` (disabled), so other accounts keep their existing deadline-based timeout unless configured explicitly. The response reserve defaults to `300ms`. With an attempt timeout enabled, admission reserves the full attempt timeout plus response reserve for both initial calls and retries; `PAYMENT_RETRY_PROCESSING_TIME_FACTOR` applies only when the attempt timeout is disabled.
+For direct Java launches, the attempt timeout defaults to `0ms` (disabled), retaining the deadline-based timeout unless configured explicitly. The response reserve defaults to `300ms`. With an attempt timeout enabled, admission reserves the full attempt timeout plus response reserve for both initial calls and retries; `PAYMENT_RETRY_PROCESSING_TIME_FACTOR` applies only when the attempt timeout is disabled.
+
+### Remote test configuration
+
+The runtime Docker image sets `PAYMENT_ATTEMPT_TIMEOUT=1500ms` and `PAYMENT_RESPONSE_TIMEOUT_RESERVE=300ms`, matching the validated local `acc-7` and `acc-16` runs. The remote runner builds this Dockerfile, so the settings are available without extra fields in its `/run` request. The application logs the effective retry settings for each account at startup.
+
+These image defaults apply to every selected account. For accounts with a different latency profile, override the environment variables at container startup; `PAYMENT_ATTEMPT_TIMEOUT=0ms` disables the per-attempt limit. Direct Java launches still default to `0ms` unless the variable is set.
+
+Run the two requests in `test-on-prem-run.http` sequentially, waiting for all terminal payment outcomes before starting the next case. Select the branch containing the Dockerfile change.
 
 ### Payment retry metric
 
