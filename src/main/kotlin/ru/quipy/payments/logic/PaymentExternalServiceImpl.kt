@@ -35,6 +35,8 @@ class PaymentExternalSystemAdapterImpl(
     private val maxAttempts: Int,
     private val retryableStatuses: Set<Int>,
     processingTimeFactor: Double,
+    private val attemptTimeout: Duration = Duration.ZERO,
+    private val responseTimeoutReserve: Duration = Duration.ofMillis(300),
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -44,6 +46,13 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
+    init {
+        require(!attemptTimeout.isNegative) { "Attempt timeout must not be negative" }
+        require(responseTimeoutReserve.toMillis() > 0) { "Response timeout reserve must be positive" }
+        require(attemptTimeout.isZero || attemptTimeout.toMillis() > 0) { "Attempt timeout must be at least one millisecond" }
+    }
+
+    private val attemptBudget = if (attemptTimeout.isZero) null else attemptTimeout.plus(responseTimeoutReserve)
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
@@ -67,7 +76,7 @@ class PaymentExternalSystemAdapterImpl(
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         var retryDelayMs = 0L
         repeat(maxAttempts) { attempt ->
-            val processingTimeEstimate = if (attempt == 0) requestAverageProcessingTime else retryProcessingTime
+            val processingTimeEstimate = attemptBudget ?: if (attempt == 0) requestAverageProcessingTime else retryProcessingTime
             val outcome = performAttempt(paymentId, amount, paymentStartedAt, deadline, retryDelayMs, processingTimeEstimate)
             if (outcome.success || !outcome.retryable) return
             retryDelayMs = outcome.retryDelayMs
@@ -103,6 +112,14 @@ class PaymentExternalSystemAdapterImpl(
             return Outcome()
         }
 
+        val callTimeoutMs = minOf(remainingMs, attemptBudget?.toMillis() ?: remainingMs)
+        val providerTimeoutMs = if (attemptBudget == null) callTimeoutMs else
+            minOf(attemptTimeout.toMillis(), callTimeoutMs - responseTimeoutReserve.toMillis())
+        if (providerTimeoutMs <= 0) {
+            dropByDeadline(paymentId, transactionId, "no time left for provider response")
+            return Outcome()
+        }
+
         val outcome = try {
             val request = Request.Builder()
                 .url(endpoint.newBuilder()
@@ -112,12 +129,12 @@ class PaymentExternalSystemAdapterImpl(
                     .addQueryParameter("transactionId", transactionId.toString())
                     .addQueryParameter("paymentId", paymentId.toString())
                     .addQueryParameter("amount", amount.toString())
-                    .addQueryParameter("timeout", Duration.ofMillis(remainingMs).toString())
+                    .addQueryParameter("timeout", Duration.ofMillis(providerTimeoutMs).toString())
                     .build())
                 .post(emptyBody)
                 .build()
             val call = client.newCall(request)
-            call.timeout().timeout(remainingMs, TimeUnit.MILLISECONDS)
+            call.timeout().timeout(callTimeoutMs, TimeUnit.MILLISECONDS)
             call.execute().use(::readOutcome)
         } catch (exception: RetryableResponse) {
             exception.outcome
@@ -144,7 +161,8 @@ class PaymentExternalSystemAdapterImpl(
         }
         if (!response.isSuccessful) {
             return Outcome(
-                retryable = response.code in retryableStatuses,
+                retryable = response.code in retryableStatuses &&
+                    (response.code != HttpStatus.REQUEST_TIMEOUT.value() || body?.let { !it.result && it.message == "Timeout" } == true),
                 reason = "HTTP ${response.code}: ${body?.message ?: response.message}",
                 retryDelayMs = retryAfterMillis(response.header("Retry-After")) ?: 0,
             )

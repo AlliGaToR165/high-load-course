@@ -15,6 +15,7 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.util.*
+import java.time.Duration
 
 
 @Configuration
@@ -63,6 +64,8 @@ class PaymentAccountsConfig {
         @Value("\${payment.retry.max-attempts}") maxAttempts: Int,
         @Value("\${payment.retry.http-statuses}") retryableStatuses: Set<Int>,
         @Value("\${payment.retry.processing-time-factor}") processingTimeFactor: Double,
+        @Value("\${payment.retry.attempt-timeout}") attemptTimeout: Duration,
+        @Value("\${payment.retry.response-timeout-reserve}") responseTimeoutReserve: Duration,
     ): List<PaymentExternalSystemAdapter> {
         return paymentAccountProperties.map {
             PaymentExternalSystemAdapterImpl(
@@ -74,6 +77,8 @@ class PaymentAccountsConfig {
                 maxAttempts,
                 retryableStatuses,
                 processingTimeFactor,
+                attemptTimeout,
+                responseTimeoutReserve,
             )
         }
     }

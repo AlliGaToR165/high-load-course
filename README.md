@@ -35,6 +35,18 @@ docker compose -f docker-compose.yml up
 To make the application run you can start the main class `OnlineShopApplication`. It is not being launched as a docker contained to simplify and speed up the devevopment process as it is easier for you to refactor the application and re-run it immediately in the IDE.
 
 
+### Per-attempt payment timeout
+
+For the local `acc-7` test, keep the existing service name and token and run the application with:
+
+```sh
+PAYMENT_ACCOUNTS=acc-7 PAYMENT_HOST=127.0.0.1 PAYMENT_ATTEMPT_TIMEOUT=1500ms PAYMENT_RESPONSE_TIMEOUT_RESERVE=300ms java -jar target/demo-0.0.1-SNAPSHOT.jar
+```
+
+`PAYMENT_ATTEMPT_TIMEOUT` limits provider processing per attempt. The client also reserves `PAYMENT_RESPONSE_TIMEOUT_RESERVE` to receive the response, within the original payment deadline. Every attempt acquires the account rate permit. HTTP 408 is retried only when enabled in `PAYMENT_RETRY_HTTP_STATUSES` and the provider confirms `result=false` with message `Timeout`; unknown network outcomes are not retried.
+
+The attempt timeout defaults to `0ms` (disabled), so other accounts keep their existing deadline-based timeout unless configured explicitly. The response reserve defaults to `300ms`. With an attempt timeout enabled, admission reserves the full attempt timeout plus response reserve for both initial calls and retries; `PAYMENT_RETRY_PROCESSING_TIME_FACTOR` applies only when the attempt timeout is disabled.
+
 ### If you want to pull changes from the main repository into your fork
 
 The command ```git remote -v``` should include the following lines:
