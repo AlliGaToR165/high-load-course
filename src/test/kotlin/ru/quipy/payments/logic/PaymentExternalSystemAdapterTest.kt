@@ -1,6 +1,8 @@
 package ru.quipy.payments.logic
 
 import com.sun.net.httpserver.HttpServer
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
@@ -43,6 +45,7 @@ class PaymentExternalSystemAdapterTest {
         assertEquals(2, f.requests.map { it.getValue("transactionId") }.distinct().size)
         assertEquals(listOf(false, true), f.processings.map { it.success })
         assertEquals(2, f.permits)
+        assertEquals(1.0, f.retries("temporary_error"))
         assertTrue(Duration.parse(f.requests[1].getValue("timeout")) < Duration.parse(f.requests[0].getValue("timeout")))
         assertEquals(f.submissions.map { it.transactionId }, f.processings.map { it.transactionId })
     }
@@ -52,6 +55,7 @@ class PaymentExternalSystemAdapterTest {
         f.pay()
         assertEquals(1, f.requests.size)
         assertEquals(listOf(true), f.processings.map { it.success })
+        assertEquals(0.0, f.totalRetries())
     }
 
     @ParameterizedTest
@@ -71,6 +75,7 @@ class PaymentExternalSystemAdapterTest {
         assertEquals(2, f.requests.size)
         assertEquals(2, f.permits)
         assertEquals(2, f.submissions.size)
+        assertEquals(1.0, f.retries("http_$status"))
         assertEquals(listOf(false, true), f.processings.map { it.success })
     }
 
@@ -189,6 +194,7 @@ class PaymentExternalSystemAdapterTest {
         assertEquals(1, f.requests.size)
         assertEquals(2, f.permits)
         assertTrue(f.processings.last().reason!!.contains("rate permit"))
+        assertEquals(0.0, f.totalRetries())
     }
 
     @Test
@@ -226,6 +232,7 @@ class PaymentExternalSystemAdapterTest {
             assertEquals(2, f.requests.size)
             assertEquals(listOf(false, true), f.processings.map { it.success })
             assertEquals("HTTP 408: Timeout", f.processings.first().reason)
+            assertEquals(1.0, f.retries("http_408"))
             assertEquals(listOf(Duration.ofMillis(150), Duration.ofMillis(150)), f.requests.map { Duration.parse(it.getValue("timeout")) })
             assertEquals(listOf(Duration.ofMillis(350), Duration.ofMillis(350)), f.processingTimeEstimates)
             assertEquals(2, f.permits)
@@ -241,6 +248,7 @@ class PaymentExternalSystemAdapterTest {
             f.pay(budgetMs = 900)
             assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt) < 1_000)
             assertTrue(f.requests.size in 1..5)
+            assertEquals((f.requests.size - 1).toDouble(), f.retries("http_408"))
             assertTrue(f.processings.none { it.success })
             assertTrue(f.processings.last().reason!!.contains("Deadline"))
         }
@@ -254,6 +262,7 @@ class PaymentExternalSystemAdapterTest {
             assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt) < 1_000)
             assertEquals(1, f.requests.size)
             assertTrue(f.processings.single().reason!!.startsWith("Unknown payment outcome"))
+            assertEquals(0.0, f.totalRetries())
         }
 
     @Test
@@ -298,6 +307,7 @@ class PaymentExternalSystemAdapterTest {
             f.pay(budgetMs = 5_000)
             assertEquals(10, f.requests.size)
             assertEquals(10, f.permits)
+            assertEquals(9.0, f.retries("http_408"))
             assertTrue(f.processings.last().success)
             for (index in 8 until f.permitTimes.size) {
                 assertTrue(TimeUnit.NANOSECONDS.toMillis(f.permitTimes[index] - f.permitTimes[index - 8]) >= 990)
@@ -324,6 +334,9 @@ class PaymentExternalSystemAdapterTest {
         responseTimeoutReserve: Duration = Duration.ofMillis(300),
         useRealAdmission: Boolean = false,
     ) : AutoCloseable {
+        private val meterRegistry = SimpleMeterRegistry().also { Metrics.addRegistry(it) }
+        fun retries(reason: String) = meterRegistry.get("payment_retries").tag("account", "acc-8").tag("reason", reason).counter().count()
+        fun totalRetries() = meterRegistry.find("payment_retries").counters().sumOf { it.count() }
         val paymentId: UUID = UUID.randomUUID()
         val submissions get() = records.filter { it.eventTitle == "PAYMENT_SUBMITTED_EVENT" }
             .map { mapper.toEvent(it.payload, PaymentSubmittedEvent::class) as PaymentSubmittedEvent }
@@ -424,6 +437,8 @@ class PaymentExternalSystemAdapterTest {
             admission?.close()
             server.stop(0)
             executor.shutdownNow()
+            Metrics.removeRegistry(meterRegistry)
+            meterRegistry.close()
         }
     }
 }

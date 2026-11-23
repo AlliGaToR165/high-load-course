@@ -7,3 +7,8 @@ providers:
     options:
       path:
         /etc/grafana/provisioning/dashboards/ServicesStatistic.json
+  - name: Payment retries
+    folder: bombardier
+    type: file
+    options:
+      path: /etc/grafana/provisioning/dashboards/PaymentRetries.json

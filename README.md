@@ -47,6 +47,12 @@ PAYMENT_ACCOUNTS=acc-7 PAYMENT_HOST=127.0.0.1 PAYMENT_ATTEMPT_TIMEOUT=1500ms PAY
 
 The attempt timeout defaults to `0ms` (disabled), so other accounts keep their existing deadline-based timeout unless configured explicitly. The response reserve defaults to `300ms`. With an attempt timeout enabled, admission reserves the full attempt timeout plus response reserve for both initial calls and retries; `PAYMENT_RETRY_PROCESSING_TIME_FACTOR` applies only when the attempt timeout is disabled.
 
+### Payment retry metric
+
+`payment_retries_total{account,reason}` counts repeated HTTP attempts started after the first attempt for a payment. It increments immediately before executing the HTTP call, after deadline checks and rate admission. A retry cancelled before execution is not counted; a started call that subsequently fails to connect is counted. Reasons identify the previous retryable response (`http_408`, `http_429`, other configured HTTP statuses, or `temporary_error`), without payment IDs or provider message text in labels.
+
+Use `sum by (account, reason) (increase(payment_retries_total[$__range]))` for a time window or `sum by (account, reason) (rate(payment_retries_total[$__rate_interval]))` for retries per second. `increase` is extrapolated; use counter differences across known run boundaries for exact test totals.
+
 ### If you want to pull changes from the main repository into your fork
 
 The command ```git remote -v``` should include the following lines:
