@@ -22,6 +22,7 @@ import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
 import java.util.*
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import kotlin.math.ceil
 
@@ -63,6 +64,11 @@ class PaymentExternalSystemAdapterImpl(
     private val endpoint = "http://$paymentProviderHostPort/external/process".toHttpUrl()
     private val metricTags = Tags.of("account", accountName)
     private val deadlineDropped = Metrics.counter("payment_deadline_dropped", metricTags)
+    private val providerSlots = Semaphore(properties.parallelRequests, true)
+
+    init {
+        Metrics.gauge("payment_provider_inflight", metricTags, providerSlots) { (properties.parallelRequests - it.availablePermits()).toDouble() }
+    }
     private val retryCounters = (retryableStatuses.map { "http_$it" } + "temporary_error").associateWith { reason ->
         Metrics.counter("payment_retries", metricTags.and("reason", reason))
     }
@@ -128,15 +134,34 @@ class PaymentExternalSystemAdapterImpl(
             return Outcome()
         }
 
+        if (!acquireProviderSlot(deadline, admissionEstimate)) {
+            dropByDeadline(paymentId, transactionId, "waiting for provider parallel slot")
+            return Outcome()
+        }
+        val outcome = try {
+            callProvider(paymentId, transactionId, amount, deadline, admissionEstimate, retryReason, providerAttemptTimeout) ?: return Outcome()
+        } finally {
+            providerSlots.release()
+        }
+
+        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${outcome.success}, message: ${outcome.reason}")
+
+        paymentESService.update(paymentId) {
+            it.logProcessing(outcome.success, now(), transactionId, reason = outcome.reason)
+        }
+        return outcome
+    }
+
+    private fun callProvider(paymentId: UUID, transactionId: UUID, amount: Int, deadline: Long, admissionEstimate: Duration, retryReason: String?, providerAttemptTimeout: Duration): Outcome? {
         if (!paymentCallAdmission.awaitCall(accountName, deadline, admissionEstimate)) {
             dropByDeadline(paymentId, transactionId, "waiting for account rate permit")
-            return Outcome()
+            return null
         }
 
         val remainingMs = remainingTimeMs(deadline)
         if (Thread.currentThread().isInterrupted || remainingMs <= 0) {
             dropByDeadline(paymentId, transactionId, "before external request")
-            return Outcome()
+            return null
         }
 
         val attemptBudget = if (providerAttemptTimeout.isZero) null else providerAttemptTimeout.plus(responseTimeoutReserve)
@@ -145,7 +170,7 @@ class PaymentExternalSystemAdapterImpl(
             minOf(providerAttemptTimeout.toMillis(), callTimeoutMs - responseTimeoutReserve.toMillis())
         if (providerTimeoutMs <= 0) {
             dropByDeadline(paymentId, transactionId, "no time left for provider response")
-            return Outcome()
+            return null
         }
 
         val requestStartedAt = System.nanoTime()
@@ -184,12 +209,18 @@ class PaymentExternalSystemAdapterImpl(
             else -> "error"
         })).record(elapsedNanos, TimeUnit.NANOSECONDS)
 
-        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${outcome.success}, message: ${outcome.reason}")
-
-        paymentESService.update(paymentId) {
-            it.logProcessing(outcome.success, now(), transactionId, reason = outcome.reason)
-        }
         return outcome
+    }
+
+    private fun acquireProviderSlot(deadline: Long, processingTimeEstimate: Duration): Boolean {
+        val maxWaitMs = deadline - now() - processingTimeEstimate.toMillis()
+        if (Thread.currentThread().isInterrupted || maxWaitMs <= 0) return false
+        return try {
+            providerSlots.tryAcquire(maxWaitMs, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
     }
 
     private fun readOutcome(response: Response): Outcome {
