@@ -16,6 +16,7 @@ import ru.quipy.apigateway.ratelimit.PaymentCallAdmission
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.time.Duration
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
@@ -37,6 +38,7 @@ class PaymentExternalSystemAdapterImpl(
     processingTimeFactor: Double,
     private val attemptTimeout: Duration = Duration.ZERO,
     private val responseTimeoutReserve: Duration = Duration.ofMillis(300),
+    adaptiveSettings: AdaptiveTimeoutSettings = AdaptiveTimeoutSettings(),
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -52,7 +54,8 @@ class PaymentExternalSystemAdapterImpl(
         require(attemptTimeout.isZero || attemptTimeout.toMillis() > 0) { "Attempt timeout must be at least one millisecond" }
     }
 
-    private val attemptBudget = if (attemptTimeout.isZero) null else attemptTimeout.plus(responseTimeoutReserve)
+    private val adaptiveTimeout = if (adaptiveSettings.enabled && attemptTimeout.isZero)
+        AdaptivePaymentTimeout(properties.averageProcessingTime, adaptiveSettings) else null
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
@@ -77,22 +80,29 @@ class PaymentExternalSystemAdapterImpl(
         .build()
 
     init {
-        logger.info("[$accountName] Payment retry configuration: attemptTimeout=$attemptTimeout, responseTimeoutReserve=$responseTimeoutReserve, maxAttempts=$maxAttempts, retryableStatuses=$retryableStatuses")
+        logger.info("[$accountName] Payment retry configuration: adaptive=${adaptiveTimeout != null}, attemptTimeout=${adaptiveTimeout?.timeout() ?: attemptTimeout}, responseTimeoutReserve=$responseTimeoutReserve, maxAttempts=$maxAttempts, retryableStatuses=$retryableStatuses")
+        adaptiveTimeout?.let { estimator ->
+            Metrics.gauge("payment_adaptive_timeout_seconds", metricTags, estimator) { it.timeout().toMillis() / 1000.0 }
+            Metrics.gauge("payment_adaptive_samples", metricTags, estimator) { it.sampleCount().toDouble() }
+            Metrics.gauge("payment_adaptive_censored_fraction", metricTags, estimator) { it.censoredFraction() }
+        }
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         var retryDelayMs = 0L
         var retryReason: String? = null
         repeat(maxAttempts) { attempt ->
+            val providerAttemptTimeout = adaptiveTimeout?.timeout() ?: attemptTimeout
+            val attemptBudget = if (providerAttemptTimeout.isZero) null else providerAttemptTimeout.plus(responseTimeoutReserve)
             val processingTimeEstimate = attemptBudget ?: if (attempt == 0) requestAverageProcessingTime else retryProcessingTime
-            val outcome = performAttempt(paymentId, amount, paymentStartedAt, deadline, retryDelayMs, processingTimeEstimate, retryReason)
+            val outcome = performAttempt(paymentId, amount, paymentStartedAt, deadline, retryDelayMs, processingTimeEstimate, retryReason, providerAttemptTimeout)
             if (outcome.success || !outcome.retryable) return
             retryDelayMs = outcome.retryDelayMs
             retryReason = outcome.retryReason
         }
     }
 
-    private fun performAttempt(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, retryDelayMs: Long, processingTimeEstimate: Duration, retryReason: String?): Outcome {
+    private fun performAttempt(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, retryDelayMs: Long, processingTimeEstimate: Duration, retryReason: String?, providerAttemptTimeout: Duration): Outcome {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -105,12 +115,20 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        if (!waitForRetry(retryDelayMs, deadline, processingTimeEstimate)) {
+        val admissionEstimate = if (adaptiveTimeout == null) processingTimeEstimate else {
+            val availableMs = remainingTimeMs(deadline) - retryDelayMs - responseTimeoutReserve.toMillis()
+            if (availableMs <= 0) {
+                dropByDeadline(paymentId, transactionId, "no time left for provider response")
+                return Outcome()
+            }
+            Duration.ofMillis(minOf(processingTimeEstimate.toMillis(), availableMs))
+        }
+        if (!waitForRetry(retryDelayMs, deadline, admissionEstimate)) {
             dropByDeadline(paymentId, transactionId, "before external request")
             return Outcome()
         }
 
-        if (!paymentCallAdmission.awaitCall(accountName, deadline, processingTimeEstimate)) {
+        if (!paymentCallAdmission.awaitCall(accountName, deadline, admissionEstimate)) {
             dropByDeadline(paymentId, transactionId, "waiting for account rate permit")
             return Outcome()
         }
@@ -121,14 +139,16 @@ class PaymentExternalSystemAdapterImpl(
             return Outcome()
         }
 
+        val attemptBudget = if (providerAttemptTimeout.isZero) null else providerAttemptTimeout.plus(responseTimeoutReserve)
         val callTimeoutMs = minOf(remainingMs, attemptBudget?.toMillis() ?: remainingMs)
         val providerTimeoutMs = if (attemptBudget == null) callTimeoutMs else
-            minOf(attemptTimeout.toMillis(), callTimeoutMs - responseTimeoutReserve.toMillis())
+            minOf(providerAttemptTimeout.toMillis(), callTimeoutMs - responseTimeoutReserve.toMillis())
         if (providerTimeoutMs <= 0) {
             dropByDeadline(paymentId, transactionId, "no time left for provider response")
             return Outcome()
         }
 
+        val requestStartedAt = System.nanoTime()
         val outcome = try {
             val request = Request.Builder()
                 .url(endpoint.newBuilder()
@@ -149,8 +169,20 @@ class PaymentExternalSystemAdapterImpl(
         } catch (exception: RetryableResponse) {
             exception.outcome
         } catch (exception: IOException) {
-            Outcome(reason = "Unknown payment outcome: ${exception.javaClass.simpleName}")
+            Outcome(reason = "Unknown payment outcome: ${exception.javaClass.simpleName}", censored = exception is InterruptedIOException && !Thread.currentThread().isInterrupted)
         }
+
+        val elapsedNanos = System.nanoTime() - requestStartedAt
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(elapsedNanos).coerceAtLeast(1)
+        if (outcome.success || outcome.censored) {
+            val observedMs = if (outcome.providerTimedOut) minOf(elapsedMs, providerTimeoutMs) else elapsedMs
+            adaptiveTimeout?.observe(observedMs, outcome.censored)
+        }
+        Metrics.timer("payment_attempt_duration", metricTags.and("outcome", when {
+            outcome.success -> "success"
+            outcome.censored -> "timeout"
+            else -> "error"
+        })).record(elapsedNanos, TimeUnit.NANOSECONDS)
 
         logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${outcome.success}, message: ${outcome.reason}")
 
@@ -170,12 +202,16 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
         if (!response.isSuccessful) {
+            val confirmedTimeout = response.code == HttpStatus.REQUEST_TIMEOUT.value() &&
+                body?.let { !it.result && it.message == "Timeout" } == true
             return Outcome(
                 retryable = response.code in retryableStatuses &&
-                    (response.code != HttpStatus.REQUEST_TIMEOUT.value() || body?.let { !it.result && it.message == "Timeout" } == true),
+                    (response.code != HttpStatus.REQUEST_TIMEOUT.value() || confirmedTimeout),
                 reason = "HTTP ${response.code}: ${body?.message ?: response.message}",
                 retryDelayMs = retryAfterMillis(response.header("Retry-After")) ?: 0,
                 retryReason = "http_${response.code}",
+                censored = confirmedTimeout,
+                providerTimedOut = confirmedTimeout,
             )
         }
         if (body == null) return Outcome(reason = "Invalid payment provider response")
@@ -232,6 +268,8 @@ class PaymentExternalSystemAdapterImpl(
         val reason: String? = null,
         val retryDelayMs: Long = 0,
         val retryReason: String? = null,
+        val censored: Boolean = false,
+        val providerTimedOut: Boolean = false,
     )
     private class RetryableResponse(val outcome: Outcome) : IOException("Retryable payment response")
 }

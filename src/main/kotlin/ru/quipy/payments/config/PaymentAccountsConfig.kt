@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import org.springframework.beans.factory.annotation.Value
+import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import ru.quipy.apigateway.ratelimit.PaymentCallAdmission
@@ -19,6 +20,7 @@ import java.time.Duration
 
 
 @Configuration
+@EnableConfigurationProperties(AdaptiveTimeoutSettings::class)
 class PaymentAccountsConfig {
     companion object {
         private val javaClient = HttpClient.newBuilder().build()
@@ -66,6 +68,7 @@ class PaymentAccountsConfig {
         @Value("\${payment.retry.processing-time-factor}") processingTimeFactor: Double,
         @Value("\${payment.retry.attempt-timeout}") attemptTimeout: Duration,
         @Value("\${payment.retry.response-timeout-reserve}") responseTimeoutReserve: Duration,
+        adaptiveSettings: AdaptiveTimeoutSettings,
     ): List<PaymentExternalSystemAdapter> {
         return paymentAccountProperties.map {
             PaymentExternalSystemAdapterImpl(
@@ -79,6 +82,7 @@ class PaymentAccountsConfig {
                 processingTimeFactor,
                 attemptTimeout,
                 responseTimeoutReserve,
+                adaptiveSettings,
             )
         }
     }

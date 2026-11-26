@@ -314,6 +314,50 @@ class PaymentExternalSystemAdapterTest {
             }
         }
 
+    @Test
+    fun `adaptive timeout retries a confirmed provider timeout`() =
+        Fixture(averageProcessingTime = Duration.ofMillis(150), adaptiveSettings = AdaptiveTimeoutSettings()).use { f ->
+            f.responses.add(Reply(delayMs = 1000, respectProviderTimeout = true))
+            f.responses.add(Reply())
+            f.pay(budgetMs = 2000)
+            assertEquals(listOf(false, true), f.processings.map { it.success })
+            assertEquals(2, f.permits)
+            assertEquals(1.0, f.retries("http_408"))
+            assertEquals(Duration.ofMillis(188), Duration.parse(f.requests.first().getValue("timeout")))
+        }
+
+    @Test
+    fun `adaptive estimate longer than remaining deadline still allows a bounded attempt`() =
+        Fixture(averageProcessingTime = Duration.ofSeconds(10), responseTimeoutReserve = Duration.ofMillis(100),
+            adaptiveSettings = AdaptiveTimeoutSettings()).use { f ->
+            f.responses.add(Reply(delayMs = 20))
+            f.pay(budgetMs = 700)
+            assertEquals(1, f.requests.size)
+            assertTrue(f.processings.single().success)
+            val timeout = Duration.parse(f.requests.single().getValue("timeout")).toMillis()
+            assertTrue(timeout in 1..600)
+        }
+
+    @Test
+    fun `adaptive mode never retries unknown network outcomes`() =
+        Fixture(averageProcessingTime = Duration.ofMillis(100), responseTimeoutReserve = Duration.ofMillis(100),
+            adaptiveSettings = AdaptiveTimeoutSettings()).use { f ->
+            f.responses.add(Reply(delayMs = 1000))
+            f.pay(budgetMs = 1500)
+            assertEquals(1, f.requests.size)
+            assertTrue(f.processings.single().reason!!.startsWith("Unknown payment outcome"))
+            assertEquals(0.0, f.totalRetries())
+        }
+
+    @Test
+    fun `explicit timeout overrides adaptive mode`() =
+        Fixture(averageProcessingTime = Duration.ofSeconds(3), attemptTimeout = Duration.ofMillis(150),
+            adaptiveSettings = AdaptiveTimeoutSettings()).use { f ->
+            f.pay()
+            assertTrue(f.processings.single().success)
+            assertEquals(Duration.ofMillis(150), Duration.parse(f.requests.single().getValue("timeout")))
+        }
+
     private data class Reply(
         val status: Int = 200,
         val result: Boolean = true,
@@ -333,6 +377,7 @@ class PaymentExternalSystemAdapterTest {
         attemptTimeout: Duration = Duration.ZERO,
         responseTimeoutReserve: Duration = Duration.ofMillis(300),
         useRealAdmission: Boolean = false,
+        adaptiveSettings: AdaptiveTimeoutSettings = AdaptiveTimeoutSettings(enabled = false),
     ) : AutoCloseable {
         private val meterRegistry = SimpleMeterRegistry().also { Metrics.addRegistry(it) }
         fun retries(reason: String) = meterRegistry.get("payment_retries").tag("account", "acc-8").tag("reason", reason).counter().count()
@@ -426,6 +471,7 @@ class PaymentExternalSystemAdapterTest {
             processingTimeFactor,
             attemptTimeout,
             responseTimeoutReserve,
+            adaptiveSettings,
         )
 
         fun pay(budgetMs: Long = 3_500) {
