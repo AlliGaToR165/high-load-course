@@ -30,6 +30,7 @@ class PayOrderAdmissionProperties {
     var safetyMarginFactor: Double = 0.1
     var processingTimeReserveFactor: Double = 2.0
     var retryAfter: Duration = Duration.ofSeconds(1)
+    var processingConcurrencyFactor: Double = 1.0
 }
 
 @Configuration
@@ -60,10 +61,12 @@ class PayOrderAdmissionQueue(
     private val processingBudgetMs = accounts.sumOf { it.averageProcessingTime.toMillis() } +
         if (accounts.size > 1) accounts.size * 1_000L else 0L
     private val processingTimeReserveMs = ceil(processingBudgetMs * settings.processingTimeReserveFactor).toLong()
-    private val maxConcurrent = minOf(OrderPayer.PAYMENT_WORKER_COUNT, accounts.minOf { it.parallelRequests })
+    private val providerConcurrency = minOf(OrderPayer.PAYMENT_WORKER_COUNT, accounts.minOf { it.parallelRequests })
+    private val processingConcurrency = ceil(providerConcurrency * settings.processingConcurrencyFactor).toInt()
+        .coerceIn(providerConcurrency, maxOf(providerConcurrency, OrderPayer.PAYMENT_WORKER_COUNT))
     private val sustainableRatePerSecond = accounts.minOf { account ->
         minOf(account.rateLimitPerSec.toDouble(), account.parallelRequests * 1_000.0 / processingBudgetMs)
-    }.coerceAtMost(maxConcurrent * 1_000.0 / processingBudgetMs)
+    }.coerceAtMost(providerConcurrency * 1_000.0 / processingBudgetMs)
     private val rateWindows = accounts.associate { it.accountName to ArrayDeque<Long>() }
     private val actualCallWindows = accounts.associate { it.accountName to ArrayDeque<Long>() }
     private val retrySlotIntervalNanos = ceil(TimeUnit.SECONDS.toNanos(1) / sustainableRatePerSecond).toLong().coerceAtLeast(1)
@@ -72,7 +75,7 @@ class PayOrderAdmissionQueue(
     private val requests = ArrayDeque<QueuedRequest>()
     private var nextRetrySlotNanos = 0L
     private val dispatcher = Executors.newSingleThreadExecutor(NamedThreadFactory("pay-order-admission"))
-    private val handoff = Executors.newFixedThreadPool(maxConcurrent, NamedThreadFactory("pay-order-handoff"))
+    private val handoff = Executors.newFixedThreadPool(processingConcurrency, NamedThreadFactory("pay-order-handoff"))
     private val inFlight = AtomicInteger(0)
     private val closed = AtomicBoolean(false)
     private val rejectedByCapacity = Metrics.counter("payment_admission_rejected", "reason", "capacity")
@@ -90,6 +93,9 @@ class PayOrderAdmissionQueue(
         }
         require(settings.retryAfter.seconds > 0 && settings.retryAfter.nano == 0) {
             "Retry-After must be a positive whole number of seconds"
+        }
+        require(settings.processingConcurrencyFactor.isFinite() && settings.processingConcurrencyFactor >= 1.0) {
+            "Pay order processing concurrency factor must be finite and at least 1"
         }
 
         Metrics.gauge("payment_admission_queued", this) { it.queueSize().toDouble() }
@@ -169,9 +175,9 @@ class PayOrderAdmissionQueue(
     private fun canAdmit(deadline: Long, nowMs: Long, safetyMarginMs: Long, nowNanos: Long): Boolean {
         expireRateWindows(nowNanos)
         val ahead = requests.size
-        val freeSlots = maxConcurrent - inFlight.get()
+        val freeSlots = providerConcurrency - inFlight.get()
         val concurrencyWaves = if (ahead < freeSlots) 0 else
-            (ahead + 1 - freeSlots + maxConcurrent - 1) / maxConcurrent
+            (ahead + 1 - freeSlots + providerConcurrency - 1) / providerConcurrency
         val concurrencyWaitMs = concurrencyWaves.toLong() * processingBudgetMs
         val rateWaitMs = accounts.maxOf { account ->
             val timestamps = rateWindows.getValue(account.accountName)
@@ -239,14 +245,14 @@ class PayOrderAdmissionQueue(
         deadline - nowMs > processingTimeReserveMs + safetyMarginMs
 
     private fun canStart(nowNanos: Long): Boolean {
-        if (inFlight.get() >= maxConcurrent) return false
+        if (inFlight.get() >= processingConcurrency) return false
         expireRateWindows(nowNanos)
         return accounts.all { rateWindows.getValue(it.accountName).size < it.rateLimitPerSec }
     }
 
     private fun nextDispatchCheckNanos(nowNanos: Long): Long {
         val maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(10)
-        if (requests.isEmpty() || inFlight.get() >= maxConcurrent) return maxWaitNanos
+        if (requests.isEmpty() || inFlight.get() >= processingConcurrency) return maxWaitNanos
         val permitNanos = accounts.maxOf { account ->
             val timestamps = rateWindows.getValue(account.accountName)
             if (timestamps.size < account.rateLimitPerSec) 0L
@@ -307,7 +313,7 @@ class PayOrderAdmissionQueue(
             if (timestamps.size < account.rateLimitPerSec) 0L else
                 (timestamps.first + TimeUnit.SECONDS.toNanos(1) - nowNanos).coerceAtLeast(0)
         }
-        val slotWaitNanos = if (inFlight.get() >= maxConcurrent) TimeUnit.MILLISECONDS.toNanos(processingBudgetMs) else 0L
+        val slotWaitNanos = if (inFlight.get() >= processingConcurrency) TimeUnit.MILLISECONDS.toNanos(processingBudgetMs) else 0L
         val queueWaitNanos = ceil(requests.size * TimeUnit.SECONDS.toNanos(1) / sustainableRatePerSecond).toLong()
         val earliestRetryNanos = nowNanos + maxOf(settings.retryAfter.toNanos(), rateWaitNanos, slotWaitNanos, queueWaitNanos)
         val scheduledRetryNanos = maxOf(earliestRetryNanos, nextRetrySlotNanos)

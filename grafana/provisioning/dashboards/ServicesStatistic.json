@@ -3578,6 +3578,34 @@
           ],
           "title": "Dispatch and rejection rate",
           "type": "timeseries"
+        },
+        {
+          "fieldConfig": {
+            "defaults": {
+              "min": 0
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 24
+          },
+          "id": 106,
+          "targets": [
+            {
+              "expr": "sum by (account) (payment_provider_inflight)",
+              "legendFormat": "at provider {{account}}",
+              "refId": "A"
+            },
+            {
+              "expr": "payment_admission_inflight",
+              "legendFormat": "in processing",
+              "refId": "B"
+            }
+          ],
+          "title": "Provider slots vs payments in processing",
+          "type": "timeseries"
         }
       ],
       "title": "Payments admission",
